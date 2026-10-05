@@ -1,0 +1,18 @@
+{
+  "name": "sensoria-attendance",
+  "version": "1.0.0",
+  "description": "Simple web-based check-in / check-out system for part-time and gig workers, with supervisor approval and monthly CSV export.",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

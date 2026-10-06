@@ -10,7 +10,7 @@ const { html, layout } = require('./views');
 const workerRoutes = require('./routes/worker');
 const adminRoutes = require('./routes/admin');
 
-function createApp({ dbPath, dataDir }) {
+function createApp({ dbPath, dataDir, storageWarning = null }) {
   const db = openDb(dbPath);
   const selfieDir = path.join(dataDir, 'selfies');
   fs.mkdirSync(selfieDir, { recursive: true });
@@ -21,6 +21,9 @@ function createApp({ dbPath, dataDir }) {
   if (process.env.TRUST_PROXY) {
     const v = process.env.TRUST_PROXY;
     app.set('trust proxy', v === 'true' ? true : /^\d+$/.test(v) ? Number(v) : v);
+  } else if (process.env.RAILWAY_ENVIRONMENT) {
+    // Railway terminates HTTPS at its proxy, one hop in front of the app.
+    app.set('trust proxy', 1);
   }
 
   app.use((req, res, next) => {
@@ -33,6 +36,11 @@ function createApp({ dbPath, dataDir }) {
         "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; form-action 'self'",
     });
     next();
+  });
+
+  app.get('/healthz', (req, res) => {
+    db.prepare('SELECT 1').get();
+    res.type('text').send('ok');
   });
 
   app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: '1h' }));
@@ -61,7 +69,8 @@ function createApp({ dbPath, dataDir }) {
   function renderPage(res, opts, status = 200) {
     const req = res.req;
     const flash = opts.flash !== undefined ? opts.flash : (typeof req.query.ok === 'string' ? req.query.ok : null);
-    res.status(status).type('html').send(layout({ user: req.user, ...opts, flash }));
+    const warning = storageWarning && req.user && req.user.role === 'supervisor' ? storageWarning : null;
+    res.status(status).type('html').send(layout({ user: req.user, ...opts, flash, warning }));
   }
 
   // ---------- Login / logout / first-run setup ----------

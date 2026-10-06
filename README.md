@@ -81,17 +81,31 @@ npm start          # http://localhost:3000
 On first visit, the setup page creates the first supervisor. Then add workers on **People** and add your venue on
 **Settings → Work sites** (stand at the venue and tap "Use my current location").
 
-### Deploying (HTTPS is required)
+### Deploying on Railway (recommended)
 
-Phones only allow GPS and camera access on **HTTPS** sites, so the app must be served over HTTPS.
-The simplest options:
+Phones only allow GPS on **HTTPS** sites, and Railway provides HTTPS automatically. Expect about US$5/month on the
+Hobby plan. The repo already includes `railway.json` and a `Dockerfile`, so there's nothing to configure in code.
 
-- **Small VPS** (DigitalOcean, Lightsail, Hetzner; about US$5/month) with [Caddy](https://caddyserver.com) in front.
-  Caddy gets HTTPS certificates automatically: `your-domain.com { reverse_proxy localhost:3000 }`.
-- **Railway / Render / Fly.io** using the included `Dockerfile`. **Attach a persistent volume at `/data`**,
-  otherwise data is lost on redeploy.
+1. Go to [railway.com](https://railway.com) and **sign in with GitHub**, using the account that owns this repo.
+   Choose the Hobby plan.
+2. **New Project → Deploy from GitHub repo →** pick `sensoria-attendance`. Allow Railway access to the repo if asked.
+3. **Add storage. Don't skip this, or all data is wiped on every update.** Right-click the service on the project
+   canvas (or use the command palette, ⌘K / Ctrl+K) → **Add Volume** → mount path `/data`. Until a volume is
+   attached, supervisors see a red warning banner in the app.
+4. Service → **Settings → Networking → Generate Domain**. This gives you a link like
+   `https://sensoria-attendance-production.up.railway.app`.
+5. Open the link. The first visit shows the setup page: create the supervisor account. Then add the venue under
+   **Settings → Work sites**, add workers under **People**, and send each worker the link with their ID and PIN.
 
-Back up the `data/` folder, which holds the database and selfies, regularly.
+Every push to the deployed branch redeploys automatically, and the data on the volume is kept. To use your own domain
+(e.g. `attendance.yourcompany.com`), add it under Settings → Networking → Custom Domain and create the DNS record it
+shows. Back up regularly: Railway volumes support backups in the volume's settings.
+
+### Deploying elsewhere
+
+Any host that runs Docker works with the included `Dockerfile`. Mount persistent storage at `/data`, serve the app
+over HTTPS, and set `TRUST_PROXY=1` when it sits behind a proxy. On a VPS, [Caddy](https://caddyserver.com) handles
+HTTPS automatically: `your-domain.com { reverse_proxy localhost:3000 }`.
 
 ### Configuration (environment variables)
 
@@ -99,8 +113,8 @@ Back up the `data/` folder, which holds the database and selfies, regularly.
 |---|---|---|
 | `PORT` | `3000` | HTTP port |
 | `APP_TZ` | `Asia/Kuala_Lumpur` | Time zone for work dates, display and exports. Set this to your location. |
-| `DATA_DIR` | `./data` | Where the database and selfies are stored |
-| `TRUST_PROXY` | (unset) | Set to `1` (or `true`) behind Caddy/nginx/a PaaS so the real client IP is used (needed for the WiFi check and login rate-limiting) |
+| `DATA_DIR` | `./data` (`/data` in Docker; the volume on Railway) | Where the database and selfies are stored |
+| `TRUST_PROXY` | (unset; automatic on Railway) | Set to `1` (or `true`) behind Caddy/nginx/a PaaS so the real client IP is used (needed for the WiFi check and login rate-limiting) |
 | `COOKIE_SECURE` | auto | Force `true` if HTTPS ends at a proxy and `TRUST_PROXY` isn't set |
 | `MAX_SHIFT_HOURS` | `16` | An open shift older than this counts as "forgot to clock out" |
 

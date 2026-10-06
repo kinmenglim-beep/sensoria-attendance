@@ -92,7 +92,7 @@ function nav(user, active) {
     </nav>`;
 }
 
-function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [] }) {
+function layout({ title, user = null, active = '', flash = null, error = null, warning = null, body, scripts = [] }) {
   return html`<!doctype html>
 <html lang="en">
 <head>
@@ -107,6 +107,7 @@ function layout({ title, user = null, active = '', flash = null, error = null, b
 <body>
   ${nav(user, active)}
   <main class="container">
+    ${warning ? html`<div class="alert alert-error" role="alert"><strong>⚠ ${warning}</strong></div>` : ''}
     ${flash ? html`<div class="alert alert-ok" role="status">${flash}</div>` : ''}
     ${error ? html`<div class="alert alert-error" role="alert">${error}</div>` : ''}
     ${body}

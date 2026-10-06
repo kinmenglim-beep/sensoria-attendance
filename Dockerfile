@@ -4,7 +4,6 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY src ./src
 COPY public ./public
-ENV NODE_ENV=production DATA_DIR=/data PORT=3000
-VOLUME /data
+ENV NODE_ENV=production DATA_DIR=/data PORT=3000 APP_TZ=Asia/Kuala_Lumpur
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "--disable-warning=ExperimentalWarning", "src/index.js"]

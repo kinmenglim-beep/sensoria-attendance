@@ -12,7 +12,7 @@ const {
 const { checkGeofence, normalizeIp, parseAllowList, ipAllowed } = require('../verify');
 const { html, statusBadge, flagList, fmtHours, fmtMoney } = require('../views');
 const { round2 } = require('../report');
-const { resolveDevice } = require('../device');
+const { resolveDevice, checkRegistration, recentDeviceCount } = require('../device');
 
 const MAX_SELFIE_BYTES = 2 * 1024 * 1024;
 // An open shift older than this is treated as "forgot to clock out".
@@ -148,17 +148,33 @@ module.exports = function workerRoutes({ db, selfieDir, render, requireWorker })
       flags.push(`${p}:off_network`);
     }
 
-    // 3. Device: flag a phone this worker hasn't used before, or one another worker also uses.
+    // 3. Device: the worker's registered phone, phones shared between workers, frequent phone changes.
     const device = resolveDevice(db, req, res, req.body);
-    const knownDevices = db.prepare(`
-      SELECT in_device_id AS d FROM shifts WHERE user_id = ? AND in_device_id IS NOT NULL
-      UNION SELECT out_device_id FROM shifts WHERE user_id = ? AND out_device_id IS NOT NULL
-    `).all(uid, uid).map((r) => r.d);
-    if (knownDevices.length && !knownDevices.includes(device.id)) flags.push(`${p}:new_device`);
+    if (s.device_mode !== 'off') {
+      const { registered } = checkRegistration(db, uid, device.id);
+      if (!registered) {
+        if (s.device_mode === 'block') {
+          return res.status(403).json({ error: "This phone isn't registered to you. Please use your usual phone, or ask your supervisor to approve this one." });
+        }
+        flags.push(`${p}:unregistered_device`);
+      }
+    }
+    const alertCount = Number(s.device_alert_count) || 0;
+    // Count includes this device even though the shift isn't saved yet.
+    const usedBefore = db.prepare('SELECT 1 FROM shifts WHERE user_id = ? AND (in_device_id = ? OR out_device_id = ?) AND check_in_at >= ? LIMIT 1')
+      .get(uid, device.id, device.id, new Date(Date.now() - 30 * 86400000).toISOString());
+    if (alertCount >= 2 && recentDeviceCount(db, uid) + (usedBefore ? 0 : 1) >= alertCount) flags.push(`${p}:many_devices`);
     if (db.prepare('SELECT 1 FROM shifts WHERE user_id <> ? AND (in_device_id = ? OR out_device_id = ?) LIMIT 1').get(uid, device.id, device.id)) {
       flags.push(`${p}:shared_device`);
     }
     if (action === 'out' && open.in_device_id && open.in_device_id !== device.id) flags.push('out:device_changed');
+    if (action === 'out' && open.in_device_id === device.id) {
+      // Same phone as check-in: don't repeat device flags already raised at check-in.
+      const inFlags = String(open.flags || '').split(',');
+      for (let i = flags.length - 1; i >= 0; i--) {
+        if (/device/.test(flags[i]) && inFlags.includes(flags[i].replace(/^out:/, 'in:'))) flags.splice(i, 1);
+      }
+    }
 
     // 4. Selfie
     const needSelfie = s.selfie === 'both' || (s.selfie === 'in' && action === 'in');

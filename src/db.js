@@ -46,6 +46,18 @@ CREATE TABLE IF NOT EXISTS devices (
   last_seen  TEXT NOT NULL
 );
 
+-- Each worker's registered phone(s). 'pending' = used but not yet reviewed,
+-- 'dismissed' = supervisor looked at it and chose not to register it.
+CREATE TABLE IF NOT EXISTS worker_devices (
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  status      TEXT NOT NULL CHECK (status IN ('approved', 'pending', 'dismissed')),
+  created_at  TEXT NOT NULL,
+  reviewed_by INTEGER REFERENCES users(id),
+  reviewed_at TEXT,
+  PRIMARY KEY (user_id, device_id)
+);
+
 -- One row per check-in/check-out pair. Times are stored as UTC ISO strings;
 -- work_date is the local (APP_TZ) date of the check-in.
 CREATE TABLE IF NOT EXISTS shifts (
@@ -89,6 +101,10 @@ const DEFAULT_SETTINGS = {
   // off | flag | block — what to do when the request doesn't come from the venue network.
   ip_mode: 'off',
   allowed_ips: '',
+  // off | flag | block — what to do when a worker uses a phone that isn't registered to them.
+  device_mode: 'flag',
+  // Alert when a worker uses this many different phones within 30 days.
+  device_alert_count: '3',
 };
 
 function openDb(dbPath) {

@@ -84,6 +84,54 @@ function resolveDevice(db, req, res, body = {}) {
   return db.prepare('SELECT * FROM devices WHERE device_key = ?').get(key);
 }
 
+const DEVICE_WINDOW_DAYS = 30;
+
+/**
+ * Check the device against the worker's registered phone(s). The first phone a
+ * worker ever uses is registered automatically; any other phone is recorded as
+ * 'pending' for a supervisor to review. Returns { registered, autoRegistered }.
+ */
+function checkRegistration(db, userId, deviceId) {
+  const now = new Date().toISOString();
+  const rows = db.prepare('SELECT device_id, status FROM worker_devices WHERE user_id = ?').all(userId);
+  const approved = rows.filter((r) => r.status === 'approved').map((r) => r.device_id);
+  if (approved.includes(deviceId)) return { registered: true, autoRegistered: false };
+  if (!approved.length) {
+    db.prepare(`
+      INSERT INTO worker_devices (user_id, device_id, status, created_at) VALUES (?, ?, 'approved', ?)
+      ON CONFLICT(user_id, device_id) DO UPDATE SET status = 'approved'
+    `).run(userId, deviceId, now);
+    return { registered: true, autoRegistered: true };
+  }
+  db.prepare("INSERT OR IGNORE INTO worker_devices (user_id, device_id, status, created_at) VALUES (?, ?, 'pending', ?)")
+    .run(userId, deviceId, now);
+  return { registered: false, autoRegistered: false };
+}
+
+/** Number of different devices a worker clocked in/out with in the last 30 days. */
+function recentDeviceCount(db, userId) {
+  const since = new Date(Date.now() - DEVICE_WINDOW_DAYS * 86400000).toISOString();
+  return db.prepare(`
+    SELECT COUNT(DISTINCT d) AS n FROM (
+      SELECT in_device_id AS d FROM shifts WHERE user_id = ? AND check_in_at >= ?
+      UNION ALL SELECT out_device_id FROM shifts WHERE user_id = ? AND check_in_at >= ?
+    ) WHERE d IS NOT NULL
+  `).get(userId, since, userId, since).n;
+}
+
+/** Active workers who used at least `threshold` devices in the last 30 days. */
+function frequentDeviceChangers(db, threshold) {
+  const since = new Date(Date.now() - DEVICE_WINDOW_DAYS * 86400000).toISOString();
+  return db.prepare(`
+    SELECT u.id, u.name, COUNT(DISTINCT x.d) AS n FROM (
+      SELECT user_id, in_device_id AS d, check_in_at AS t FROM shifts
+      UNION ALL SELECT user_id, out_device_id, check_in_at FROM shifts
+    ) x JOIN users u ON u.id = x.user_id
+    WHERE x.d IS NOT NULL AND x.t >= ? AND u.active = 1 AND u.role = 'worker'
+    GROUP BY u.id HAVING n >= ? ORDER BY n DESC, u.name
+  `).all(since, threshold);
+}
+
 /** Short display name with a fingerprint so two identical phones can be told apart. */
 const deviceName = (label, key) => (label ? `${label} #${String(key || '').slice(0, 6)}` : null);
 
@@ -92,4 +140,7 @@ const DEVICE_COLUMNS = `dvi.label AS in_device_label, dvi.device_key AS in_devic
   dvo.label AS out_device_label, dvo.device_key AS out_device_key`;
 const DEVICE_JOINS = `LEFT JOIN devices dvi ON dvi.id = s.in_device_id LEFT JOIN devices dvo ON dvo.id = s.out_device_id`;
 
-module.exports = { describeDevice, resolveDevice, deviceName, DEVICE_COLUMNS, DEVICE_JOINS };
+module.exports = {
+  describeDevice, resolveDevice, deviceName, checkRegistration, recentDeviceCount, frequentDeviceChangers,
+  DEVICE_COLUMNS, DEVICE_JOINS, DEVICE_WINDOW_DAYS,
+};

@@ -14,7 +14,9 @@ const { normalizeIp } = require('../verify');
 const { html, statusBadge, flagList, fmtHours, fmtMoney, FLAG_LABELS } = require('../views');
 const { monthReport } = require('../report');
 const { toCsv } = require('../csv');
-const { deviceName, DEVICE_COLUMNS, DEVICE_JOINS } = require('../device');
+const {
+  deviceName, frequentDeviceChangers, recentDeviceCount, DEVICE_COLUMNS, DEVICE_JOINS,
+} = require('../device');
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -77,7 +79,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
         ${selectable ? html`
           <div class="form-actions">
             <button type="submit" class="btn btn-primary">Approve selected</button>
-            <span class="muted small">Flagged shifts: open “View” to check the selfie / location before approving.</span>
+            <span class="muted small">Flagged shifts: open “View” to check the location and phone before approving.</span>
           </div>` : ''}
       </form>`;
   }
@@ -113,6 +115,14 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     `).all(today);
     const otherPending = db.prepare("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?").get(date).n;
     const back = `/admin?date=${date}`;
+    const settings = getSettings(db);
+    const alertCount = Number(settings.device_alert_count) || 0;
+    const deviceChangers = alertCount >= 2 ? frequentDeviceChangers(db, alertCount) : [];
+    const phonesToReview = settings.device_mode === 'off' ? [] : db.prepare(`
+      SELECT wd.user_id, u.name, d.label, d.device_key FROM worker_devices wd
+      JOIN users u ON u.id = wd.user_id JOIN devices d ON d.id = wd.device_id
+      WHERE wd.status = 'pending' AND u.active = 1 ORDER BY wd.created_at
+    `).all();
 
     render(res, {
       title: 'Dashboard',
@@ -140,6 +150,18 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
             <strong>${staleOpen.length} worker${staleOpen.length > 1 ? 's' : ''} never clocked out on an earlier day:</strong>
             ${staleOpen.map((s, i) => html`${i ? ', ' : ' '}<a href="/admin/shifts/${s.id}">${s.name} (${prettyDate(s.work_date)})</a>`)}.
             Open the shift to enter the correct check-out time.
+          </div>` : ''}
+        ${deviceChangers.length ? html`
+          <div class="alert alert-error">
+            <strong>🚩 Frequent phone changes (last 30 days):</strong>
+            ${deviceChangers.map((w, i) => html`${i ? ', ' : ' '}<a href="/admin/people/${w.id}#devices">${w.name} (${w.n} phones)</a>`)}.
+            Someone else may be clocking in for them.
+          </div>` : ''}
+        ${phonesToReview.length ? html`
+          <div class="alert alert-warn">
+            <strong>📱 Unregistered phones to review:</strong>
+            ${phonesToReview.map((x, i) => html`${i ? ', ' : ' '}<a href="/admin/people/${x.user_id}#devices">${x.name} — ${deviceName(x.label, x.device_key)}</a>`)}.
+            Register it if the worker changed phone; otherwise check with them.
           </div>` : ''}
         ${otherPending ? html`
           <div class="alert alert-info">${otherPending} completed shift${otherPending > 1 ? 's' : ''} on other days still waiting for approval. <a href="/admin/pending">Review →</a></div>` : ''}
@@ -511,6 +533,12 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     return { v };
   }
 
+  function phoneCount(userId) {
+    const n = recentDeviceCount(db, userId);
+    const limit = Number(getSettings(db).device_alert_count) || 0;
+    return limit >= 2 && n >= limit ? html`<span class="flag">🚩 ${n}</span>` : n;
+  }
+
   function peoplePage(res, { error = null, values = {} } = {}, status = 200) {
     const people = db.prepare(`
       SELECT u.*, (SELECT MAX(check_in_at) FROM shifts WHERE user_id = u.id) AS last_seen
@@ -533,7 +561,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
         <section class="card">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Name</th><th>Sign-in ID</th><th>Role</th><th class="num">Rate</th><th>Last check-in</th><th>Status</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Sign-in ID</th><th>Role</th><th class="num">Rate</th><th>Last check-in</th><th class="num">Phones (30 days)</th><th>Status</th><th></th></tr></thead>
               <tbody>
                 ${people.map((p) => html`
                   <tr class="${p.active ? '' : 'inactive'}">
@@ -541,6 +569,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
                     <td>${p.role === 'supervisor' ? 'Supervisor' : 'Worker'}</td>
                     <td class="num">${p.hourly_rate != null ? fmtMoney(p.hourly_rate) : '—'}</td>
                     <td>${p.last_seen ? localDateTime(p.last_seen) : '—'}</td>
+                    <td class="num">${p.role === 'worker' ? phoneCount(p.id) : ''}</td>
                     <td>${p.active ? 'Active' : 'Inactive'}</td>
                     <td><a href="/admin/people/${p.id}">Edit</a></td>
                   </tr>`)}
@@ -585,33 +614,76 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
   }
 
   function devicesCard(person) {
+    const used = `(s.in_device_id = d.id OR s.out_device_id = d.id)`;
     const devices = db.prepare(`
-      SELECT d.id, d.label, d.device_key, MIN(s.check_in_at) AS first_used, MAX(s.check_in_at) AS last_used, COUNT(DISTINCT s.id) AS shifts,
-        (SELECT GROUP_CONCAT(DISTINCT u2.name) FROM shifts s2 JOIN users u2 ON u2.id = s2.user_id
-          WHERE (s2.in_device_id = d.id OR s2.out_device_id = d.id) AND s2.user_id <> ?) AS others
-      FROM devices d JOIN shifts s ON s.in_device_id = d.id OR s.out_device_id = d.id
-      WHERE s.user_id = ?
-      GROUP BY d.id ORDER BY last_used DESC
-    `).all(person.id, person.id);
+      SELECT d.id, d.label, d.device_key, wd.status, wd.reviewed_at, r.name AS reviewer,
+        (SELECT MIN(s.check_in_at) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS first_used,
+        (SELECT MAX(s.check_in_at) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS last_used,
+        (SELECT COUNT(*) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS shifts,
+        (SELECT GROUP_CONCAT(DISTINCT u2.name) FROM shifts s JOIN users u2 ON u2.id = s.user_id
+          WHERE ${used} AND s.user_id <> :uid) AS others
+      FROM devices d
+      LEFT JOIN worker_devices wd ON wd.device_id = d.id AND wd.user_id = :uid
+      LEFT JOIN users r ON r.id = wd.reviewed_by
+      WHERE wd.user_id IS NOT NULL OR EXISTS (SELECT 1 FROM shifts s WHERE s.user_id = :uid AND ${used})
+      ORDER BY wd.status = 'approved' DESC, last_used DESC
+    `).all({ uid: person.id });
+    const n = recentDeviceCount(db, person.id);
+    const limit = Number(getSettings(db).device_alert_count) || 0;
+    const statusLabel = (d) => {
+      if (d.status === 'approved') return html`<span class="badge badge-approved">Registered</span>${d.reviewer ? html`<div class="muted small">by ${d.reviewer}</div>` : html`<div class="muted small">first phone used</div>`}`;
+      if (d.status === 'pending') return html`<span class="badge badge-pending">To review</span>`;
+      return html`<span class="badge badge-rejected">Not registered</span>`;
+    };
+    const action = (d, act, label, cls = 'btn btn-small') => html`
+      <form method="post" action="/admin/people/${person.id}/devices/${d.id}">
+        <input type="hidden" name="action" value="${act}">
+        <button class="${cls}" type="submit">${label}</button>
+      </form>`;
     return html`
-      <section class="card">
-        <h2>Devices used</h2>
+      <section class="card" id="devices">
+        <div class="row-between">
+          <h2>Phones</h2>
+          <span class="${limit >= 2 && n >= limit ? 'flag' : 'muted'}">${n} different phone${n === 1 ? '' : 's'} in the last 30 days</span>
+        </div>
         ${devices.length ? html`
           <div class="table-wrap"><table>
-            <thead><tr><th>Device</th><th>First used</th><th>Last used</th><th class="num">Shifts</th><th>Also used by</th></tr></thead>
+            <thead><tr><th>Device</th><th>Status</th><th>Used</th><th>Also used by</th><th></th></tr></thead>
             <tbody>${devices.map((d) => html`
               <tr>
                 <td>📱 ${deviceName(d.label, d.device_key)}</td>
-                <td>${localDateTime(d.first_used)}</td><td>${localDateTime(d.last_used)}</td>
-                <td class="num">${d.shifts}</td>
+                <td>${statusLabel(d)}</td>
+                <td>${d.shifts ? html`${d.shifts} shift${d.shifts === 1 ? '' : 's'}<div class="muted small">${localDate(d.first_used) === localDate(d.last_used) ? localDateTime(d.last_used) : html`${prettyDate(localDate(d.first_used))} – ${prettyDate(localDate(d.last_used))}`}</div>` : html`<span class="muted">Blocked attempt only</span>`}</td>
                 <td>${d.others ? html`<span class="flag">${d.others.split(',').join(', ')}</span>` : html`<span class="muted">—</span>`}</td>
+                <td><div class="action-row tight">
+                  ${d.status !== 'approved' ? action(d, 'approve', 'Register') : action(d, 'remove', 'Unregister', 'btn-link danger')}
+                  ${d.status === 'pending' ? action(d, 'dismiss', 'Ignore', 'btn-link') : ''}
+                </div></td>
               </tr>`)}
             </tbody>
           </table></div>
-          <p class="hint">Only supervisors can see this. A new device can be innocent (new phone, cleared browser data, private browsing), so check with the worker before acting on it.</p>`
+          <p class="hint">Only supervisors can see this. The first phone a worker uses is registered automatically; check-ins from any other phone are flagged.
+            When a worker genuinely gets a new phone, tap <strong>Register</strong> (and unregister the old one).
+            A one-off new phone can be innocent (cleared browser data, private browsing, a different browser), but frequent changes or a phone shared with another worker are red flags.</p>`
         : html`<p class="muted">No check-ins yet.</p>`}
       </section>`;
   }
+
+  router.post('/admin/people/:id/devices/:deviceId', (req, res) => {
+    const userId = Number(req.params.id);
+    const deviceId = Number(req.params.deviceId);
+    const person = db.prepare("SELECT id, name FROM users WHERE id = ? AND role = 'worker'").get(userId);
+    const device = db.prepare('SELECT id FROM devices WHERE id = ?').get(deviceId);
+    if (!person || !device) return res.sendStatus(404);
+    const status = { approve: 'approved', dismiss: 'dismissed', remove: 'dismissed' }[req.body.action];
+    if (!status) return res.sendStatus(400);
+    db.prepare(`
+      INSERT INTO worker_devices (user_id, device_id, status, created_at, reviewed_by, reviewed_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, device_id) DO UPDATE SET status = excluded.status, reviewed_by = excluded.reviewed_by, reviewed_at = excluded.reviewed_at
+    `).run(userId, deviceId, status, new Date().toISOString(), req.user.id, new Date().toISOString());
+    const msg = { approve: 'Phone registered.', dismiss: 'Phone kept unregistered — check-ins from it stay flagged.', remove: 'Phone unregistered.' }[req.body.action];
+    res.redirect(withMsg(`/admin/people/${userId}`, msg) + '#devices');
+  });
 
   router.get('/admin/people/:id', (req, res) => {
     const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
@@ -677,6 +749,17 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
                 ${opt('selfie', 'both', 'At check-in and check-out')}
               </select>
             </label>
+            <label>Phone check
+              <select name="device_mode">
+                ${opt('device_mode', 'flag', 'Flag check-ins from a phone that isn\u2019t registered to the worker (recommended)')}
+                ${opt('device_mode', 'block', 'Only allow the worker\u2019s registered phone')}
+                ${opt('device_mode', 'off', 'Off — record the device only')}
+              </select>
+              <span class="hint">The first phone a worker uses is registered automatically. Register a new phone on the worker’s page under People.</span>
+            </label>
+            <label>Alert when a worker uses this many different phones in 30 days
+              <input type="number" name="device_alert_count" min="2" max="20" value="${s.device_alert_count}">
+            </label>
             <label>Venue WiFi (public IP address)
               <select name="ip_mode">
                 ${opt('ip_mode', 'off', 'Off')}
@@ -728,6 +811,9 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       setSetting(db, 'selfie', pick(b.selfie, ['none', 'in', 'both'], 'none'));
       setSetting(db, 'ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off'));
       setSetting(db, 'allowed_ips', String(b.allowed_ips || '').slice(0, 2000));
+      setSetting(db, 'device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag'));
+      const alertCount = Math.round(Number(b.device_alert_count));
+      setSetting(db, 'device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3);
     });
     res.redirect(withMsg('/admin/settings', 'Settings saved.'));
   });

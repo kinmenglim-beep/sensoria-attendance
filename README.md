@@ -31,7 +31,7 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 | Method | How it works | Effort for workers | Cheating resistance | Notes |
 |---|---|---|---|---|
 | **GPS geofence** ✅ | The phone's location is compared with your venue(s) | None (one-time "allow location") | Medium | Works on any phone. Indoor GPS can be off by 20–100 m, so use a 100–200 m radius. |
-| **Device check** ✅ | Each phone/browser gets a permanent anonymous device ID | None | Medium (catches buddy-punching) | Always on. Only supervisors can see it. |
+| **Device check** ✅ | Each worker's phone is registered; other phones, shared phones and frequent changes are flagged | None | Medium–High (catches buddy-punching) | Only supervisors can see it. Can be set to allow the registered phone only. |
 | **Selfie** | Front-camera photo at check-in | One tap | High | Off by default. Turn it on in Settings if needed. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
@@ -46,14 +46,28 @@ random device ID, stored as a cookie with a backup copy in the browser. The supe
 `iPhone · iOS 17.5 · Safari #7KrwTr` or `SM-A515F · Android 13 · Chrome #Qx81aB`. The `#code` tells apart two
 phones of the same model.
 
-Automatic flags, **visible to supervisors only**:
-- **New device**: the worker clocked in/out on a device they haven't used before.
-- **Device also used by another worker**: someone may be clocking in for a friend on their own phone.
+**Registered phone.** Gig workers normally keep the same phone, so each worker's **first** phone is registered
+automatically. Supervisors see these automatic flags; workers never do:
+- **Not their registered phone**: the worker clocked in/out on a different phone. The phone also appears under
+  **📱 Unregistered phones to review** on the dashboard. If the worker genuinely changed phone, open their page
+  (People → name → *Phones*) and tap **Register**, and unregister the old one. Otherwise tap **Ignore**, and check-ins
+  from that phone stay flagged.
+- **🚩 Many different phones lately**: the worker used 3 or more different phones in the last 30 days. They are
+  listed in a red alert at the top of the dashboard and marked 🚩 in the People list. This is the strongest sign that
+  someone else is clocking in for them. The number is adjustable in Settings.
+- **Device also used by another worker**: the same phone was used by two workers, e.g. a friend clocking in for a
+  buddy on their own phone.
 - **Clocked out on a different device**: the check-out phone differs from the check-in phone.
 
-The shift page shows who else used the same device, and each worker's page on **People** lists every device they've
-used. Workers never see any of this. Keep in mind a "new device" can be innocent: a new phone, cleared browser data,
-private/incognito mode, a different browser, or iPhone "Add to Home Screen" (which counts as a separate browser).
+**Settings → Phone check** has three modes:
+- **Flag** (default): unregistered phones are allowed but flagged.
+- **Only allow the registered phone**: other phones are refused. The worker is asked to use their usual phone or get
+  the new one approved, and the attempt shows up for review.
+- **Off**: the device is recorded only.
+
+A one-off new phone can be innocent: cleared browser data, private/incognito mode, a different browser, or iPhone
+"Add to Home Screen" (which counts as a separate browser). Ask the worker before acting on a single flag. Repeated
+changes or sharing are the real red flags.
 
 ## Running it
 

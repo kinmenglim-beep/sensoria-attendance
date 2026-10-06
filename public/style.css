@@ -218,3 +218,4 @@ tr.inactive td { color: var(--muted); }
 .history { list-style: none; margin: 0; padding: 0; }
 .history li { padding: 12px 0; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
 .history li:last-child { border-bottom: 0; }
+.action-row.tight { margin-top: 0; gap: 6px; flex-direction: column; align-items: flex-start; }

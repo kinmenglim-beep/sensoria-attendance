@@ -226,7 +226,7 @@ test('a forgotten clock-out is auto-closed and must be fixed before approval', a
   assert.equal(Math.round((Date.parse(fixed.check_out_at) - Date.parse(fixed.check_in_at)) / 3600000), 6);
 });
 
-test('devices: new, shared and changed devices are flagged for supervisors only', async (t) => {
+test('devices: registered phone, shared and changed devices are flagged for supervisors only', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attendance-'));
   const app = createApp({ dbPath: path.join(dir, 'test.db'), dataDir: dir });
   const server = app.listen(0);
@@ -238,20 +238,22 @@ test('devices: new, shared and changed devices are flagged for supervisors only'
 
   const sup = client(base);
   await sup('POST', '/setup', { form: { name: 'S', login: 's', secret: 'password1' } });
-  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', selfie: 'none', ip_mode: 'off', allowed_ips: '' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', selfie: 'none', ip_mode: 'off', allowed_ips: '', device_mode: 'flag', device_alert_count: '3' } });
   await sup('POST', '/admin/people', { form: { name: 'Alice', login: 'alice', role: 'worker', secret: '1111' } });
   await sup('POST', '/admin/people', { form: { name: 'Bob', login: 'bob', role: 'worker', secret: '2222' } });
+  const aliceId = db.prepare("SELECT id FROM users WHERE login = 'alice'").get().id;
 
   const iphoneUa = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
   const alicePhone = client(base, { userAgent: iphoneUa });
   await alicePhone('POST', '/login', { form: { login: 'alice', secret: '1111' } });
 
-  // First ever check-in: nothing to compare against, so no flag.
+  // First ever check-in registers the phone automatically: no flag.
   let r = await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
   assert.equal(r.status, 200);
   assert.ok(JSON.parse(r.text).deviceKey);
   await alicePhone('POST', '/api/clock', { json: { action: 'out' } });
   assert.equal(flagsOf(lastId()), '');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM worker_devices WHERE user_id = ? AND status = 'approved'").get(aliceId).n, 1);
 
   // Same phone again: still no flag.
   await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
@@ -262,16 +264,23 @@ test('devices: new, shared and changed devices are flagged for supervisors only'
   await otherPhone('POST', '/login', { form: { login: 'alice', secret: '1111' } });
   r = await otherPhone('POST', '/api/clock', { json: { action: 'out' } });
   assert.equal(r.status, 200);
-  assert.equal(flagsOf(lastId()), 'out:new_device,out:device_changed');
+  assert.equal(flagsOf(lastId()), 'out:unregistered_device,out:device_changed');
+
+  // The supervisor dashboard lists it as a phone to review.
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /Unregistered phones to review/);
+  assert.match(r.text, /Alice — SM-A515F · Android 13 · Chrome/);
 
   // Bob signs in on Alice's phone (the device cookie survives log-out).
   await alicePhone('POST', '/logout');
   await alicePhone('POST', '/login', { form: { login: 'bob', secret: '2222' } });
   r = await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
   assert.equal(r.status, 200);
-  assert.doesNotMatch(JSON.parse(r.text).message, /device/i);
+  assert.doesNotMatch(JSON.parse(r.text).message, /device|phone/i);
   const bobShift = lastId();
+  // It's Bob's first phone so it registers for him, but it's shared with Alice.
   assert.equal(flagsOf(bobShift), 'in:shared_device');
+  await alicePhone('POST', '/api/clock', { json: { action: 'out' } });
 
   // The device key also works from localStorage if the cookie was lost.
   const aliceKey = db.prepare('SELECT device_key FROM devices WHERE label LIKE ?').get('iPhone%').device_key;
@@ -279,21 +288,51 @@ test('devices: new, shared and changed devices are flagged for supervisors only'
   await fresh('POST', '/login', { form: { login: 'alice', secret: '1111' } });
   await fresh('POST', '/api/clock', { json: { action: 'in', deviceKey: aliceKey } });
   assert.equal(flagsOf(lastId()), 'in:shared_device');
+  await fresh('POST', '/api/clock', { json: { action: 'out' } });
 
   // Supervisor sees the device and who else used it.
   r = await sup('GET', `/admin/shifts/${bobShift}`);
   assert.match(r.text, /iPhone · iOS 17\.5 · Safari #/);
   assert.match(r.text, /Also used by: Alice/);
-  r = await sup('GET', '/admin/people/' + db.prepare("SELECT id FROM users WHERE login = 'alice'").get().id);
-  assert.match(r.text, /Devices used/);
-  assert.match(r.text, /SM-A515F · Android 13 · Chrome/);
+  r = await sup('GET', `/admin/people/${aliceId}`);
+  assert.match(r.text, /Registered/);
+  assert.match(r.text, /To review/);
+  assert.match(r.text, /2 different phones in the last 30 days/);
   r = await sup('GET', `/admin/export/detail.csv?month=${localDate().slice(0, 7)}`);
   assert.match(r.text, /Check-in Device/);
   assert.match(r.text, /Device also used by another worker/);
 
+  // Supervisor registers Alice's new Android phone: no more flag from it.
+  const android = db.prepare('SELECT id FROM devices WHERE label LIKE ?').get('SM-A515F%').id;
+  r = await sup('POST', `/admin/people/${aliceId}/devices/${android}`, { form: { action: 'approve' } });
+  assert.equal(r.status, 302);
+  await otherPhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(flagsOf(lastId()), '');
+  await otherPhone('POST', '/api/clock', { json: { action: 'out' } });
+
+  // A third phone within 30 days trips the "many phones" alert.
+  const thirdPhone = client(base, { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36' });
+  await thirdPhone('POST', '/login', { form: { login: 'alice', secret: '1111' } });
+  await thirdPhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(flagsOf(lastId()), 'in:unregistered_device,in:many_devices');
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /Frequent phone changes/);
+  assert.match(r.text, /Alice \(3 phones\)/);
+  r = await sup('GET', '/admin/people');
+  assert.match(r.text, /🚩 3/);
+  await thirdPhone('POST', '/api/clock', { json: { action: 'out' } });
+
+  // Strict mode: only registered phones can clock in.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', selfie: 'none', ip_mode: 'off', allowed_ips: '', device_mode: 'block', device_alert_count: '3' } });
+  r = await thirdPhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 403);
+  assert.match(JSON.parse(r.text).error, /isn't registered/);
+  r = await otherPhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 200);
+
   // Workers never see device info.
-  r = await alicePhone('GET', '/me');
-  assert.doesNotMatch(r.text, /iPhone|📱|new device|device also used|different device/i);
-  r = await alicePhone('GET', '/');
-  assert.doesNotMatch(r.text, /iPhone|📱|new device|device also used|different device/i);
+  r = await otherPhone('GET', '/me');
+  assert.doesNotMatch(r.text, /iPhone|📱|registered|device also used|different device|many different/i);
+  r = await otherPhone('GET', '/');
+  assert.doesNotMatch(r.text, /iPhone|📱|registered|device also used|different device|many different/i);
 });

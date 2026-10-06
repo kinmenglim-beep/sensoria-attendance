@@ -1,22 +1,18 @@
-'use strict';
-
-const express = require('express');
-
-const {
-  transaction, getSettings, setSetting, audit, addFlags, removeFlags, hasFlag,
-} = require('../db');
-const { hashSecret } = require('../auth');
-const {
+import {
+  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag,
+} from '../db.js';
+import { hashSecret } from '../auth.js';
+import {
   localDate, localTime, localDateTime, localToUtcIso, addDays, addMonths, hoursBetween, formatDuration,
   prettyDate, prettyMonth, isDate, isMonth, isTime, TZ,
-} = require('../time');
-const { normalizeIp } = require('../verify');
-const { html, statusBadge, flagList, fmtHours, fmtMoney, FLAG_LABELS } = require('../views');
-const { monthReport } = require('../report');
-const { toCsv } = require('../csv');
-const {
+} from '../time.js';
+import { normalizeIp } from '../verify.js';
+import { html, statusBadge, flagList, fmtHours, fmtMoney, FLAG_LABELS } from '../views.js';
+import { monthReport } from '../report.js';
+import { toCsv } from '../csv.js';
+import {
   deviceName, frequentDeviceChangers, recentDeviceCount, DEVICE_COLUMNS, DEVICE_JOINS,
-} = require('../device');
+} from '../device.js';
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -37,13 +33,16 @@ function locationSummary(site, distance, accuracy, lat, lng) {
   return html`${site ? html`${distance} m from ${site}` : 'Recorded'}${accuracy != null ? html` <span class="muted">(±${Math.round(accuracy)} m)</span>` : ''} ${mapLink(lat, lng)}`;
 }
 
-module.exports = function adminRoutes({ db, render, requireSupervisor }) {
-  const router = express.Router();
-  router.use('/admin', requireSupervisor);
+const isUnique = (err) => /UNIQUE/.test(String(err && err.message));
+
+export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
+  app.use('/admin', requireSupervisor);
+  app.use('/admin/*', requireSupervisor);
 
   const shiftHours = (s) => (s.check_out_at ? hoursBetween(s.check_in_at, s.check_out_at) : null);
   // Auto-closed shifts need a real check-out time before they can be approved.
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
+  const activeWorkers = (db) => db.all("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
 
   /** Table of shifts with optional checkboxes for bulk approval. */
   function shiftTable(shifts, { showDate = false, back = '/admin' } = {}) {
@@ -66,7 +65,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
                   <td class="check">${s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
                   ${showDate ? html`<td>${prettyDate(s.work_date)}</td>` : ''}
                   <td>${s.name}${s.in_device_label ? html`<div class="muted small">📱 ${deviceName(s.in_device_label, s.in_device_key)}</div>` : ''}</td>
-                  <td>${localTime(s.check_in_at)}${s.in_selfie ? html` <span title="Selfie taken">📷</span>` : ''}</td>
+                  <td>${localTime(s.check_in_at)}</td>
                   <td>${s.check_out_at ? localTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
                   <td>${flagList(s.flags) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
@@ -85,15 +84,17 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
   }
 
   // ---------- Dashboard ----------
-  router.get('/admin', (req, res) => {
+  app.get('/admin', async (c) => {
+    const db = c.get('db');
     const today = localDate();
-    const date = isDate(req.query.date) ? req.query.date : today;
-    const workers = db.prepare("SELECT id, name, login FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE").all();
-    const shifts = db.prepare(`
+    const q = c.req.query('date');
+    const date = isDate(q) ? q : today;
+    const workers = await activeWorkers(db);
+    const shifts = await db.all(`
       SELECT s.*, u.name, r.name AS reviewer_name, ${DEVICE_COLUMNS} FROM shifts s
       JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by ${DEVICE_JOINS}
       WHERE s.work_date = ? ORDER BY s.check_in_at
-    `).all(date);
+    `, date);
 
     const byUser = new Map();
     for (const s of shifts) {
@@ -109,22 +110,22 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       else done.push({ w, hours: list.reduce((a, s) => a + shiftHours(s), 0), last: list[list.length - 1].check_out_at });
     }
     const pendingCount = shifts.filter((s) => s.check_out_at && s.status === 'pending').length;
-    const staleOpen = db.prepare(`
+    const staleOpen = await db.all(`
       SELECT s.*, u.name FROM shifts s JOIN users u ON u.id = s.user_id
       WHERE s.check_out_at IS NULL AND s.work_date < ? ORDER BY s.check_in_at
-    `).all(today);
-    const otherPending = db.prepare("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?").get(date).n;
+    `, today);
+    const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
     const back = `/admin?date=${date}`;
-    const settings = getSettings(db);
+    const settings = await getSettings(db);
     const alertCount = Number(settings.device_alert_count) || 0;
-    const deviceChangers = alertCount >= 2 ? frequentDeviceChangers(db, alertCount) : [];
-    const phonesToReview = settings.device_mode === 'off' ? [] : db.prepare(`
+    const deviceChangers = alertCount >= 2 ? await frequentDeviceChangers(db, alertCount) : [];
+    const phonesToReview = settings.device_mode === 'off' ? [] : await db.all(`
       SELECT wd.user_id, u.name, d.label, d.device_key FROM worker_devices wd
       JOIN users u ON u.id = wd.user_id JOIN devices d ON d.id = wd.device_id
       WHERE wd.status = 'pending' AND u.active = 1 ORDER BY wd.created_at
-    `).all();
+    `);
 
-    render(res, {
+    return render(c, {
       title: 'Dashboard',
       active: 'dashboard',
       body: html`
@@ -195,13 +196,13 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
   });
 
   // ---------- All pending approvals ----------
-  router.get('/admin/pending', (req, res) => {
-    const shifts = db.prepare(`
+  app.get('/admin/pending', async (c) => {
+    const shifts = await c.get('db').all(`
       SELECT s.*, u.name, ${DEVICE_COLUMNS} FROM shifts s JOIN users u ON u.id = s.user_id ${DEVICE_JOINS}
       WHERE s.status = 'pending' AND s.check_out_at IS NOT NULL
       ORDER BY s.work_date, s.check_in_at
-    `).all();
-    render(res, {
+    `);
+    return render(c, {
       title: 'Approvals',
       active: 'pending',
       body: html`
@@ -215,51 +216,63 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
   });
 
   // ---------- Approve / reject ----------
-  router.post('/admin/shifts/approve', (req, res) => {
-    const ids = toIds(req.body.ids);
-    const back = safeBack(req.body.back);
-    if (!ids.length) return res.redirect(withMsg(back, 'Nothing selected.'));
+  app.post('/admin/shifts/approve', async (c) => {
+    const db = c.get('db');
+    const b = await form(c);
+    const ids = toIds(b.ids);
+    const back = safeBack(b.back);
+    if (!ids.length) return c.redirect(withMsg(back, 'Nothing selected.'));
+    const userId = c.get('user').id;
     const now = new Date().toISOString();
-    const stmt = db.prepare(`
-      UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_note = NULL
-      WHERE id = ? AND check_out_at IS NOT NULL AND status <> 'approved'
-        AND (',' || flags || ',') NOT LIKE '%,no_checkout,%'
-    `);
-    const n = transaction(db, () => {
-      let count = 0;
-      for (const id of ids) {
-        if (stmt.run(req.user.id, now, id).changes) { audit(db, id, req.user.id, 'approve'); count++; }
-      }
-      return count;
-    });
-    res.redirect(withMsg(back, `Approved ${n} shift${n === 1 ? '' : 's'}.`));
+    let n = 0;
+    // D1 allows at most 100 bound values per query, so approve in chunks.
+    for (let i = 0; i < ids.length; i += 90) {
+      const chunk = ids.slice(i, i + 90);
+      const { rows } = await db.run(`
+        UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_note = NULL
+        WHERE id IN (${chunk.map(() => '?').join(',')}) AND check_out_at IS NOT NULL AND status <> 'approved'
+          AND (',' || flags || ',') NOT LIKE '%,no_checkout,%'
+        RETURNING id
+      `, userId, now, ...chunk);
+      await db.batch(rows.map((r) => auditStmt(r.id, userId, 'approve')));
+      n += rows.length;
+    }
+    return c.redirect(withMsg(back, `Approved ${n} shift${n === 1 ? '' : 's'}.`));
   });
 
-  function loadShift(id) {
-    return db.prepare(`
+  function loadShift(db, id) {
+    return db.get(`
       SELECT s.*, u.name, u.login, r.name AS reviewer_name, ${DEVICE_COLUMNS} FROM shifts s
       JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by ${DEVICE_JOINS}
       WHERE s.id = ?
-    `).get(Number(id));
+    `, Number(id));
   }
 
-  router.post('/admin/shifts/:id/reject', (req, res) => {
-    const shift = loadShift(req.params.id);
-    if (!shift) return res.sendStatus(404);
-    if (!shift.check_out_at) return res.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Enter a check-out time before rejecting.'));
-    const note = String(req.body.review_note || '').trim().slice(0, 300) || null;
-    db.prepare("UPDATE shifts SET status = 'rejected', reviewed_by = ?, reviewed_at = ?, review_note = ? WHERE id = ?")
-      .run(req.user.id, new Date().toISOString(), note, shift.id);
-    audit(db, shift.id, req.user.id, 'reject', note);
-    res.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Shift rejected.'));
+  app.post('/admin/shifts/:id/reject', async (c) => {
+    const db = c.get('db');
+    const shift = await loadShift(db, c.req.param('id'));
+    if (!shift) return c.notFound();
+    if (!shift.check_out_at) return c.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Enter a check-out time before rejecting.'));
+    const b = await form(c);
+    const note = String(b.review_note || '').trim().slice(0, 300) || null;
+    const userId = c.get('user').id;
+    await db.batch([
+      ["UPDATE shifts SET status = 'rejected', reviewed_by = ?, reviewed_at = ?, review_note = ? WHERE id = ?",
+        userId, new Date().toISOString(), note, shift.id],
+      auditStmt(shift.id, userId, 'reject', note),
+    ]);
+    return c.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Shift rejected.'));
   });
 
-  router.post('/admin/shifts/:id/reset', (req, res) => {
-    const shift = loadShift(req.params.id);
-    if (!shift) return res.sendStatus(404);
-    db.prepare("UPDATE shifts SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL, review_note = NULL WHERE id = ?").run(shift.id);
-    audit(db, shift.id, req.user.id, 'reset_to_pending');
-    res.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Shift set back to pending.'));
+  app.post('/admin/shifts/:id/reset', async (c) => {
+    const db = c.get('db');
+    const shift = await loadShift(db, c.req.param('id'));
+    if (!shift) return c.notFound();
+    await db.batch([
+      ["UPDATE shifts SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL, review_note = NULL WHERE id = ?", shift.id],
+      auditStmt(shift.id, c.get('user').id, 'reset_to_pending'),
+    ]);
+    return c.redirect(withMsg(`/admin/shifts/${shift.id}`, 'Shift set back to pending.'));
   });
 
   // ---------- Shift detail + edit ----------
@@ -305,9 +318,10 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     return { date, inIso, outIso };
   }
 
-  router.get('/admin/shifts/new', (req, res) => {
-    const workers = db.prepare("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE").all();
-    render(res, {
+  app.get('/admin/shifts/new', async (c) => {
+    const workers = await activeWorkers(c.get('db'));
+    const qDate = c.req.query('date');
+    return render(c, {
       title: 'Add shift',
       body: html`
         <div class="page-head"><h1>Add a shift manually</h1></div>
@@ -316,20 +330,21 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
           ${shiftForm({
             action: '/admin/shifts/new',
             workers,
-            values: { user_id: req.query.user_id, work_date: isDate(req.query.date) ? req.query.date : localDate(), in_time: '', out_time: '', approve: true },
+            values: { user_id: c.req.query('user_id'), work_date: isDate(qDate) ? qDate : localDate(), in_time: '', out_time: '', approve: true },
             submitLabel: 'Add shift',
           })}
         </section>`,
     });
   });
 
-  router.post('/admin/shifts/new', (req, res) => {
-    const b = req.body;
-    const worker = db.prepare("SELECT id FROM users WHERE id = ? AND role = 'worker'").get(Number(b.user_id));
+  app.post('/admin/shifts/new', async (c) => {
+    const db = c.get('db');
+    const b = await form(c);
+    const worker = await db.get("SELECT id FROM users WHERE id = ? AND role = 'worker'", Number(b.user_id));
     const t = parseShiftTimes(b, { requireOut: true });
     if (!worker || t.error) {
-      const workers = db.prepare("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE").all();
-      return render(res, {
+      const workers = await activeWorkers(db);
+      return render(c, {
         title: 'Add shift',
         error: t.error || 'Choose a worker.',
         body: html`<div class="page-head"><h1>Add a shift manually</h1></div>
@@ -337,39 +352,41 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       }, 400);
     }
     const approve = b.approve === '1';
+    const userId = c.get('user').id;
     const now = new Date().toISOString();
-    const id = transaction(db, () => {
-      const r = db.prepare(`
-        INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, flags, status, reviewed_by, reviewed_at)
-        VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)
-      `).run(worker.id, t.date, t.inIso, t.outIso, approve ? 'approved' : 'pending', approve ? req.user.id : null, approve ? now : null);
-      const newId = Number(r.lastInsertRowid);
-      audit(db, newId, req.user.id, 'manual_add', String(b.reason || '').slice(0, 300) || null);
-      if (approve) audit(db, newId, req.user.id, 'approve');
-      return newId;
-    });
-    res.redirect(withMsg(`/admin/shifts/${id}`, 'Shift added.'));
+    const { lastId: id } = await db.run(`
+      INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, flags, status, reviewed_by, reviewed_at)
+      VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)
+    `, worker.id, t.date, t.inIso, t.outIso, approve ? 'approved' : 'pending', approve ? userId : null, approve ? now : null);
+    await db.batch([
+      auditStmt(id, userId, 'manual_add', String(b.reason || '').slice(0, 300) || null),
+      ...(approve ? [auditStmt(id, userId, 'approve')] : []),
+    ]);
+    return c.redirect(withMsg(`/admin/shifts/${id}`, 'Shift added.'));
   });
 
   /** Device line for the shift page: name, when first seen, and other workers who used it. */
-  function deviceDetail(deviceId, label, key, userId) {
+  async function deviceDetail(db, deviceId, label, key, userId) {
     if (!deviceId) return html`<p class="muted">📱 Device not recorded</p>`;
-    const dev = db.prepare('SELECT first_seen FROM devices WHERE id = ?').get(deviceId);
-    const others = db.prepare(`
+    const dev = await db.get('SELECT first_seen FROM devices WHERE id = ?', deviceId);
+    const { names: others } = await db.get(`
       SELECT GROUP_CONCAT(DISTINCT u.name) AS names FROM shifts s JOIN users u ON u.id = s.user_id
       WHERE (s.in_device_id = ? OR s.out_device_id = ?) AND s.user_id <> ?
-    `).get(deviceId, deviceId, userId).names;
+    `, deviceId, deviceId, userId);
     return html`
       <p>📱 <strong>${deviceName(label, key)}</strong><br>
         <span class="muted small">First seen ${localDateTime(dev.first_seen)}</span></p>
       ${others ? html`<p class="flag">Also used by: ${others.split(',').join(', ')}</p>` : ''}`;
   }
 
-  function shiftDetail(res, shift, { error = null, values = null } = {}, status = 200) {
-    const log = db.prepare(`
+  async function shiftDetail(c, shift, { error = null, values = null } = {}, status = 200) {
+    const db = c.get('db');
+    const log = await db.all(`
       SELECT a.*, u.name AS actor FROM audit a LEFT JOIN users u ON u.id = a.actor_id
       WHERE a.shift_id = ? ORDER BY a.at, a.id
-    `).all(shift.id);
+    `, shift.id);
+    const inDevice = await deviceDetail(db, shift.in_device_id, shift.in_device_label, shift.in_device_key, shift.user_id);
+    const outDevice = await deviceDetail(db, shift.out_device_id, shift.out_device_label, shift.out_device_key, shift.user_id);
     const hrs = shiftHours(shift);
     const v = values || {
       work_date: shift.work_date,
@@ -377,7 +394,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       out_time: shift.check_out_at && !hasFlag(shift.flags, 'no_checkout') ? localTime(shift.check_out_at) : '',
       approve: true,
     };
-    render(res, {
+    return render(c, {
       title: `Shift · ${shift.name}`,
       error,
       body: html`
@@ -424,17 +441,15 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
           <div class="card">
             <h2>Check-in verification</h2>
             <p>${locationSummary(shift.in_site, shift.in_distance_m, shift.in_accuracy, shift.in_lat, shift.in_lng)}</p>
-            ${deviceDetail(shift.in_device_id, shift.in_device_label, shift.in_device_key, shift.user_id)}
+            ${inDevice}
             ${shift.in_ip ? html`<p class="muted small">IP ${shift.in_ip}</p>` : ''}
-            ${shift.in_selfie ? html`<img class="selfie" src="/selfies/${shift.in_selfie}" alt="Check-in selfie">` : ''}
           </div>
           <div class="card">
             <h2>Check-out verification</h2>
             ${shift.check_out_at ? html`
               <p>${locationSummary(shift.out_site, shift.out_distance_m, shift.out_accuracy, shift.out_lat, shift.out_lng)}</p>
-              ${deviceDetail(shift.out_device_id, shift.out_device_label, shift.out_device_key, shift.user_id)}
+              ${outDevice}
               ${shift.out_ip ? html`<p class="muted small">IP ${shift.out_ip}</p>` : ''}
-              ${shift.out_selfie ? html`<img class="selfie" src="/selfies/${shift.out_selfie}" alt="Check-out selfie">` : ''}
             ` : html`<p class="muted">Not clocked out yet.</p>`}
           </div>
         </section>
@@ -453,18 +468,19 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     }, status);
   }
 
-  router.get('/admin/shifts/:id', (req, res) => {
-    const shift = loadShift(req.params.id);
-    if (!shift) return res.sendStatus(404);
-    shiftDetail(res, shift);
+  app.get('/admin/shifts/:id', async (c) => {
+    const shift = await loadShift(c.get('db'), c.req.param('id'));
+    if (!shift) return c.notFound();
+    return shiftDetail(c, shift);
   });
 
-  router.post('/admin/shifts/:id/edit', (req, res) => {
-    const shift = loadShift(req.params.id);
-    if (!shift) return res.sendStatus(404);
-    const b = req.body;
+  app.post('/admin/shifts/:id/edit', async (c) => {
+    const db = c.get('db');
+    const shift = await loadShift(db, c.req.param('id'));
+    if (!shift) return c.notFound();
+    const b = await form(c);
     const t = parseShiftTimes(b, { requireOut: !!shift.check_out_at });
-    if (t.error) return shiftDetail(res, shift, { error: t.error, values: b }, 400);
+    if (t.error) return shiftDetail(c, shift, { error: t.error, values: b }, 400);
 
     const changes = [];
     if (t.date !== shift.work_date) changes.push(`date ${shift.work_date} → ${t.date}`);
@@ -472,24 +488,24 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     if (t.outIso !== shift.check_out_at) changes.push(`out ${shift.check_out_at ? localDateTime(shift.check_out_at) : '—'} → ${t.outIso ? localDateTime(t.outIso) : '—'}`);
     const reason = String(b.reason || '').trim().slice(0, 300);
     const approve = b.approve === '1' && !!t.outIso && (changes.length > 0 || !hasFlag(shift.flags, 'no_checkout'));
+    const userId = c.get('user').id;
     const now = new Date().toISOString();
 
-    transaction(db, () => {
-      if (changes.length) {
-        db.prepare(`
-          UPDATE shifts SET work_date = ?, check_in_at = ?, check_out_at = ?, flags = ?,
-            status = 'pending', reviewed_by = NULL, reviewed_at = NULL, review_note = NULL
-          WHERE id = ?
-        `).run(t.date, t.inIso, t.outIso, addFlags(removeFlags(shift.flags, 'no_checkout'), 'edited'), shift.id);
-        audit(db, shift.id, req.user.id, 'edit', changes.join('; ') + (reason ? ` (${reason})` : ''));
-      }
-      if (approve && (changes.length || shift.status !== 'approved')) {
-        db.prepare("UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_note = NULL WHERE id = ?")
-          .run(req.user.id, now, shift.id);
-        audit(db, shift.id, req.user.id, 'approve');
-      }
-    });
-    res.redirect(withMsg(`/admin/shifts/${shift.id}`, changes.length ? 'Shift updated.' : approve ? 'Shift approved.' : 'No changes.'));
+    const stmts = [];
+    if (changes.length) {
+      stmts.push([`
+        UPDATE shifts SET work_date = ?, check_in_at = ?, check_out_at = ?, flags = ?,
+          status = 'pending', reviewed_by = NULL, reviewed_at = NULL, review_note = NULL
+        WHERE id = ?
+      `, t.date, t.inIso, t.outIso, addFlags(removeFlags(shift.flags, 'no_checkout'), 'edited'), shift.id]);
+      stmts.push(auditStmt(shift.id, userId, 'edit', changes.join('; ') + (reason ? ` (${reason})` : '')));
+    }
+    if (approve && (changes.length || shift.status !== 'approved')) {
+      stmts.push(["UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_note = NULL WHERE id = ?", userId, now, shift.id]);
+      stmts.push(auditStmt(shift.id, userId, 'approve'));
+    }
+    await db.batch(stmts);
+    return c.redirect(withMsg(`/admin/shifts/${shift.id}`, changes.length ? 'Shift updated.' : approve ? 'Shift approved.' : 'No changes.'));
   });
 
   // ---------- People ----------
@@ -533,18 +549,20 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     return { v };
   }
 
-  function phoneCount(userId) {
-    const n = recentDeviceCount(db, userId);
-    const limit = Number(getSettings(db).device_alert_count) || 0;
-    return limit >= 2 && n >= limit ? html`<span class="flag">🚩 ${n}</span>` : n;
-  }
-
-  function peoplePage(res, { error = null, values = {} } = {}, status = 200) {
-    const people = db.prepare(`
+  async function peoplePage(c, { error = null, values = {} } = {}, status = 200) {
+    const db = c.get('db');
+    const people = await db.all(`
       SELECT u.*, (SELECT MAX(check_in_at) FROM shifts WHERE user_id = u.id) AS last_seen
       FROM users u ORDER BY u.active DESC, u.role DESC, u.name COLLATE NOCASE
-    `).all();
-    render(res, {
+    `);
+    const limit = Number((await getSettings(db)).device_alert_count) || 0;
+    const phones = new Map();
+    for (const p of people) if (p.role === 'worker') phones.set(p.id, await recentDeviceCount(db, p.id));
+    const phoneCount = (id) => {
+      const n = phones.get(id);
+      return limit >= 2 && n >= limit ? html`<span class="flag">🚩 ${n}</span>` : n;
+    };
+    return render(c, {
       title: 'People',
       active: 'people',
       error,
@@ -580,56 +598,38 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     }, status);
   }
 
-  router.get('/admin/people', (req, res) => peoplePage(res));
+  app.get('/admin/people', (c) => peoplePage(c));
 
-  router.post('/admin/people', (req, res) => {
-    const { v, error } = validatePerson(req.body, { isNew: true });
-    if (error) return peoplePage(res, { error, values: v }, 400);
+  app.post('/admin/people', async (c) => {
+    const { v, error } = validatePerson(await form(c), { isNew: true });
+    if (error) return peoplePage(c, { error, values: v }, 400);
     try {
-      db.prepare('INSERT INTO users (name, login, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?)')
-        .run(v.name, v.login, hashSecret(v.secret), v.role, v.hourly_rate);
+      await c.get('db').run('INSERT INTO users (name, login, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?)',
+        v.name, v.login, await hashSecret(v.secret), v.role, v.hourly_rate);
     } catch (err) {
-      if (/UNIQUE/.test(err.message)) return peoplePage(res, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID is already in use.', values: v }, 400);
       throw err;
     }
-    res.redirect(withMsg('/admin/people', `${v.name} added.`));
+    return c.redirect(withMsg('/admin/people', `${v.name} added.`));
   });
 
-  function personPage(res, person, { error = null, values = null } = {}, status = 200) {
-    render(res, {
-      title: `Edit ${person.name}`,
-      active: 'people',
-      error,
-      body: html`
-        <div class="row-between page-head"><h1>${person.name}</h1><a href="/admin/people">← All people</a></div>
-        <section class="card">
-          <form method="post" action="/admin/people/${person.id}" class="stack">
-            ${personFields(values || person, { isNew: false })}
-            <label class="checkbox"><input type="checkbox" name="active" value="1" ${(values ? values.active : person.active) ? 'checked' : ''}> Active (can sign in and appears on the dashboard)</label>
-            <div><button class="btn btn-primary" type="submit">Save</button></div>
-          </form>
-        </section>
-        ${person.role === 'worker' ? devicesCard(person) : ''}`,
-    }, status);
-  }
-
-  function devicesCard(person) {
-    const used = `(s.in_device_id = d.id OR s.out_device_id = d.id)`;
-    const devices = db.prepare(`
+  async function devicesCard(db, person) {
+    const used = '(s.in_device_id = d.id OR s.out_device_id = d.id)';
+    const devices = await db.all(`
       SELECT d.id, d.label, d.device_key, wd.status, wd.reviewed_at, r.name AS reviewer,
-        (SELECT MIN(s.check_in_at) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS first_used,
-        (SELECT MAX(s.check_in_at) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS last_used,
-        (SELECT COUNT(*) FROM shifts s WHERE s.user_id = :uid AND ${used}) AS shifts,
+        (SELECT MIN(s.check_in_at) FROM shifts s WHERE s.user_id = ?1 AND ${used}) AS first_used,
+        (SELECT MAX(s.check_in_at) FROM shifts s WHERE s.user_id = ?1 AND ${used}) AS last_used,
+        (SELECT COUNT(*) FROM shifts s WHERE s.user_id = ?1 AND ${used}) AS shifts,
         (SELECT GROUP_CONCAT(DISTINCT u2.name) FROM shifts s JOIN users u2 ON u2.id = s.user_id
-          WHERE ${used} AND s.user_id <> :uid) AS others
+          WHERE ${used} AND s.user_id <> ?1) AS others
       FROM devices d
-      LEFT JOIN worker_devices wd ON wd.device_id = d.id AND wd.user_id = :uid
+      LEFT JOIN worker_devices wd ON wd.device_id = d.id AND wd.user_id = ?1
       LEFT JOIN users r ON r.id = wd.reviewed_by
-      WHERE wd.user_id IS NOT NULL OR EXISTS (SELECT 1 FROM shifts s WHERE s.user_id = :uid AND ${used})
+      WHERE wd.user_id IS NOT NULL OR EXISTS (SELECT 1 FROM shifts s WHERE s.user_id = ?1 AND ${used})
       ORDER BY wd.status = 'approved' DESC, last_used DESC
-    `).all({ uid: person.id });
-    const n = recentDeviceCount(db, person.id);
-    const limit = Number(getSettings(db).device_alert_count) || 0;
+    `, person.id);
+    const n = await recentDeviceCount(db, person.id);
+    const limit = Number((await getSettings(db)).device_alert_count) || 0;
     const statusLabel = (d) => {
       if (d.status === 'approved') return html`<span class="badge badge-approved">Registered</span>${d.reviewer ? html`<div class="muted small">by ${d.reviewer}</div>` : html`<div class="muted small">first phone used</div>`}`;
       if (d.status === 'pending') return html`<span class="badge badge-pending">To review</span>`;
@@ -669,63 +669,87 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       </section>`;
   }
 
-  router.post('/admin/people/:id/devices/:deviceId', (req, res) => {
-    const userId = Number(req.params.id);
-    const deviceId = Number(req.params.deviceId);
-    const person = db.prepare("SELECT id, name FROM users WHERE id = ? AND role = 'worker'").get(userId);
-    const device = db.prepare('SELECT id FROM devices WHERE id = ?').get(deviceId);
-    if (!person || !device) return res.sendStatus(404);
-    const status = { approve: 'approved', dismiss: 'dismissed', remove: 'dismissed' }[req.body.action];
-    if (!status) return res.sendStatus(400);
-    db.prepare(`
+  async function personPage(c, person, { error = null, values = null } = {}, status = 200) {
+    const devices = person.role === 'worker' ? await devicesCard(c.get('db'), person) : '';
+    return render(c, {
+      title: `Edit ${person.name}`,
+      active: 'people',
+      error,
+      body: html`
+        <div class="row-between page-head"><h1>${person.name}</h1><a href="/admin/people">← All people</a></div>
+        <section class="card">
+          <form method="post" action="/admin/people/${person.id}" class="stack">
+            ${personFields(values || person, { isNew: false })}
+            <label class="checkbox"><input type="checkbox" name="active" value="1" ${(values ? values.active : person.active) ? 'checked' : ''}> Active (can sign in and appears on the dashboard)</label>
+            <div><button class="btn btn-primary" type="submit">Save</button></div>
+          </form>
+        </section>
+        ${devices}`,
+    }, status);
+  }
+
+  app.post('/admin/people/:id/devices/:deviceId', async (c) => {
+    const db = c.get('db');
+    const userId = Number(c.req.param('id'));
+    const deviceId = Number(c.req.param('deviceId'));
+    const person = await db.get("SELECT id, name FROM users WHERE id = ? AND role = 'worker'", userId);
+    const device = await db.get('SELECT id FROM devices WHERE id = ?', deviceId);
+    if (!person || !device) return c.notFound();
+    const b = await form(c);
+    const status = { approve: 'approved', dismiss: 'dismissed', remove: 'dismissed' }[b.action];
+    if (!status) return c.text('Bad request', 400);
+    const now = new Date().toISOString();
+    await db.run(`
       INSERT INTO worker_devices (user_id, device_id, status, created_at, reviewed_by, reviewed_at) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, device_id) DO UPDATE SET status = excluded.status, reviewed_by = excluded.reviewed_by, reviewed_at = excluded.reviewed_at
-    `).run(userId, deviceId, status, new Date().toISOString(), req.user.id, new Date().toISOString());
-    const msg = { approve: 'Phone registered.', dismiss: 'Phone kept unregistered — check-ins from it stay flagged.', remove: 'Phone unregistered.' }[req.body.action];
-    res.redirect(withMsg(`/admin/people/${userId}`, msg) + '#devices');
+    `, userId, deviceId, status, now, c.get('user').id, now);
+    const msg = { approve: 'Phone registered.', dismiss: 'Phone kept unregistered — check-ins from it stay flagged.', remove: 'Phone unregistered.' }[b.action];
+    return c.redirect(withMsg(`/admin/people/${userId}`, msg) + '#devices');
   });
 
-  router.get('/admin/people/:id', (req, res) => {
-    const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
-    if (!person) return res.sendStatus(404);
-    personPage(res, person);
+  app.get('/admin/people/:id', async (c) => {
+    const person = await c.get('db').get('SELECT * FROM users WHERE id = ?', Number(c.req.param('id')));
+    if (!person) return c.notFound();
+    return personPage(c, person);
   });
 
-  router.post('/admin/people/:id', (req, res) => {
-    const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
-    if (!person) return res.sendStatus(404);
-    const { v, error } = validatePerson(req.body, { isNew: false });
-    v.active = req.body.active === '1' ? 1 : 0;
-    const self = person.id === req.user.id;
-    if (error) return personPage(res, person, { error, values: v }, 400);
+  app.post('/admin/people/:id', async (c) => {
+    const db = c.get('db');
+    const person = await db.get('SELECT * FROM users WHERE id = ?', Number(c.req.param('id')));
+    if (!person) return c.notFound();
+    const b = await form(c);
+    const { v, error } = validatePerson(b, { isNew: false });
+    v.active = b.active === '1' ? 1 : 0;
+    const self = person.id === c.get('user').id;
+    if (error) return personPage(c, person, { error, values: v }, 400);
     if (self && (!v.active || v.role !== 'supervisor')) {
-      return personPage(res, person, { error: "You can't deactivate yourself or remove your own supervisor role.", values: v }, 400);
+      return personPage(c, person, { error: "You can't deactivate yourself or remove your own supervisor role.", values: v }, 400);
     }
     if (v.role === 'supervisor' && person.role === 'worker'
-      && db.prepare('SELECT 1 FROM shifts WHERE user_id = ? AND check_out_at IS NULL').get(person.id)) {
-      return personPage(res, person, { error: 'This worker is still clocked in. Close their shift first.', values: v }, 400);
+      && await db.get('SELECT 1 AS x FROM shifts WHERE user_id = ? AND check_out_at IS NULL', person.id)) {
+      return personPage(c, person, { error: 'This worker is still clocked in. Close their shift first.', values: v }, 400);
     }
+    const stmts = [['UPDATE users SET name = ?, login = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
+      v.name, v.login, v.role, v.hourly_rate, v.active, person.id]];
+    if (v.secret) stmts.push(['UPDATE users SET secret_hash = ? WHERE id = ?', await hashSecret(v.secret), person.id]);
+    // Sign the person out everywhere if their access changed.
+    if (!self && (v.secret || !v.active || v.role !== person.role)) stmts.push(['DELETE FROM sessions WHERE user_id = ?', person.id]);
     try {
-      transaction(db, () => {
-        db.prepare('UPDATE users SET name = ?, login = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?')
-          .run(v.name, v.login, v.role, v.hourly_rate, v.active, person.id);
-        if (v.secret) db.prepare('UPDATE users SET secret_hash = ? WHERE id = ?').run(hashSecret(v.secret), person.id);
-        // Sign the person out everywhere if their access changed.
-        if (!self && (v.secret || !v.active || v.role !== person.role)) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(person.id);
-      });
+      await db.batch(stmts);
     } catch (err) {
-      if (/UNIQUE/.test(err.message)) return personPage(res, person, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return personPage(c, person, { error: 'That phone/staff ID is already in use.', values: v }, 400);
       throw err;
     }
-    res.redirect(withMsg('/admin/people', `${v.name} saved.`));
+    return c.redirect(withMsg('/admin/people', `${v.name} saved.`));
   });
 
   // ---------- Settings ----------
-  router.get('/admin/settings', (req, res) => {
-    const s = getSettings(db);
-    const sites = db.prepare('SELECT * FROM sites ORDER BY name').all();
+  app.get('/admin/settings', async (c) => {
+    const db = c.get('db');
+    const s = await getSettings(db);
+    const sites = await db.all('SELECT * FROM sites ORDER BY name');
     const opt = (name, value, label) => html`<option value="${value}" ${s[name] === value ? 'selected' : ''}>${label}</option>`;
-    render(res, {
+    return render(c, {
       title: 'Settings',
       active: 'settings',
       scripts: ['/settings.js'],
@@ -742,17 +766,10 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
                 ${opt('geofence_mode', 'off', 'Off — don’t ask for location')}
               </select>
             </label>
-            <label>Selfie
-              <select name="selfie">
-                ${opt('selfie', 'none', 'Off (recommended: GPS + device check is usually enough)')}
-                ${opt('selfie', 'in', 'At check-in only')}
-                ${opt('selfie', 'both', 'At check-in and check-out')}
-              </select>
-            </label>
             <label>Phone check
               <select name="device_mode">
-                ${opt('device_mode', 'flag', 'Flag check-ins from a phone that isn\u2019t registered to the worker (recommended)')}
-                ${opt('device_mode', 'block', 'Only allow the worker\u2019s registered phone')}
+                ${opt('device_mode', 'flag', 'Flag check-ins from a phone that isn’t registered to the worker (recommended)')}
+                ${opt('device_mode', 'block', 'Only allow the worker’s registered phone')}
                 ${opt('device_mode', 'off', 'Off — record the device only')}
               </select>
               <span class="hint">The first phone a worker uses is registered automatically. Register a new phone on the worker’s page under People.</span>
@@ -769,7 +786,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
             </label>
             <label>Allowed venue IP addresses
               <textarea name="allowed_ips" rows="2" placeholder="e.g. 203.0.113.25, 198.51.100.0/24">${s.allowed_ips}</textarea>
-              <span class="hint">Your current IP address is <strong>${normalizeIp(req.ip)}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
+              <span class="hint">Your current IP address is <strong>${normalizeIp(c.get('ip'))}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
             </label>
             <div><button class="btn btn-primary" type="submit">Save settings</button></div>
           </form>
@@ -803,36 +820,36 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     });
   });
 
-  router.post('/admin/settings', (req, res) => {
-    const b = req.body;
+  app.post('/admin/settings', async (c) => {
+    const b = await form(c);
     const pick = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
-    transaction(db, () => {
-      setSetting(db, 'geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag'));
-      setSetting(db, 'selfie', pick(b.selfie, ['none', 'in', 'both'], 'none'));
-      setSetting(db, 'ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off'));
-      setSetting(db, 'allowed_ips', String(b.allowed_ips || '').slice(0, 2000));
-      setSetting(db, 'device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag'));
-      const alertCount = Math.round(Number(b.device_alert_count));
-      setSetting(db, 'device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3);
-    });
-    res.redirect(withMsg('/admin/settings', 'Settings saved.'));
+    const alertCount = Math.round(Number(b.device_alert_count));
+    await c.get('db').batch([
+      setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag')),
+      setSettingStmt('ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off')),
+      setSettingStmt('allowed_ips', String(b.allowed_ips || '').slice(0, 2000)),
+      setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),
+      setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
+    ]);
+    return c.redirect(withMsg('/admin/settings', 'Settings saved.'));
   });
 
-  router.post('/admin/sites', (req, res) => {
-    const name = String(req.body.name || '').trim().slice(0, 100);
-    const lat = Number(req.body.lat);
-    const lng = Number(req.body.lng);
-    const radius = Math.round(Number(req.body.radius_m));
+  app.post('/admin/sites', async (c) => {
+    const b = await form(c);
+    const name = String(b.name || '').trim().slice(0, 100);
+    const lat = Number(b.lat);
+    const lng = Number(b.lng);
+    const radius = Math.round(Number(b.radius_m));
     if (!name || !(Math.abs(lat) <= 90) || !(Math.abs(lng) <= 180) || !(radius >= 20 && radius <= 5000)) {
-      return res.redirect(withMsg('/admin/settings', 'Could not add site: check the name, coordinates and radius.'));
+      return c.redirect(withMsg('/admin/settings', 'Could not add site: check the name, coordinates and radius.'));
     }
-    db.prepare('INSERT INTO sites (name, lat, lng, radius_m) VALUES (?, ?, ?, ?)').run(name, lat, lng, radius);
-    res.redirect(withMsg('/admin/settings', `Site “${name}” added.`));
+    await c.get('db').run('INSERT INTO sites (name, lat, lng, radius_m) VALUES (?, ?, ?, ?)', name, lat, lng, radius);
+    return c.redirect(withMsg('/admin/settings', `Site “${name}” added.`));
   });
 
-  router.post('/admin/sites/:id/delete', (req, res) => {
-    db.prepare('DELETE FROM sites WHERE id = ?').run(Number(req.params.id));
-    res.redirect(withMsg('/admin/settings', 'Site removed.'));
+  app.post('/admin/sites/:id/delete', async (c) => {
+    await c.get('db').run('DELETE FROM sites WHERE id = ?', Number(c.req.param('id')));
+    return c.redirect(withMsg('/admin/settings', 'Site removed.'));
   });
 
   // ---------- Monthly export ----------
@@ -843,10 +860,10 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     return `${String(d).padStart(2, '0')} ${wd}`;
   };
 
-  router.get('/admin/export', (req, res) => {
-    const ym = monthParam(req.query.month);
-    const rep = monthReport(db, ym);
-    render(res, {
+  app.get('/admin/export', async (c) => {
+    const ym = monthParam(c.req.query('month'));
+    const rep = await monthReport(c.get('db'), ym);
+    return render(c, {
       title: 'Monthly export',
       active: 'export',
       body: html`
@@ -898,18 +915,17 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     });
   });
 
-  function sendCsv(res, filename, rows) {
-    res.set({
+  function sendCsv(c, filename, rows) {
+    return c.body(toCsv(rows), 200, {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}"`,
       'Cache-Control': 'no-store',
     });
-    res.send(toCsv(rows));
   }
 
-  router.get('/admin/export/summary.csv', (req, res) => {
-    const ym = monthParam(req.query.month);
-    const rep = monthReport(db, ym);
+  app.get('/admin/export/summary.csv', async (c) => {
+    const ym = monthParam(c.req.query('month'));
+    const rep = await monthReport(c.get('db'), ym);
     const dayCols = Array.from({ length: rep.nDays }, (_, i) => dayLabel(ym, i + 1));
     const rows = [[
       'Month', 'Worker ID', 'Name', 'Phone / Staff ID', 'Days Worked', 'Shifts', 'Approved Hours', 'Pending Hours',
@@ -923,17 +939,17 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     }
     const t = rep.totals;
     rows.push([ym, '', 'TOTAL', '', t.daysWorked, t.shifts, t.approved, t.pending, t.rejected, t.open, '', t.pay, ...t.daily.map((h) => h || '')]);
-    sendCsv(res, `attendance-summary-${ym}.csv`, rows);
+    return sendCsv(c, `attendance-summary-${ym}.csv`, rows);
   });
 
-  router.get('/admin/export/detail.csv', (req, res) => {
-    const ym = monthParam(req.query.month);
-    const rep = monthReport(db, ym);
+  app.get('/admin/export/detail.csv', async (c) => {
+    const ym = monthParam(c.req.query('month'));
+    const rep = await monthReport(c.get('db'), ym);
     const rows = [[
       'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out', 'Hours', 'Status',
       'Approved/Rejected By', 'Approved/Rejected At', 'Review Note', 'Worker Note',
       'Check-in Site', 'Check-in Distance (m)', 'Check-in GPS', 'Check-out Site', 'Check-out Distance (m)', 'Check-out GPS',
-      'Check-in Device', 'Check-out Device', 'Selfie', 'Flags', 'Shift ID',
+      'Check-in Device', 'Check-out Device', 'Flags', 'Shift ID',
     ]];
     const gps = (lat, lng) => (lat == null ? '' : `${lat.toFixed(6)} ${lng.toFixed(6)}`);
     const shifts = [...rep.shifts].sort((a, b) => a.work_date.localeCompare(b.work_date) || a.name.localeCompare(b.name) || a.check_in_at.localeCompare(b.check_in_at));
@@ -949,13 +965,10 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
         s.in_site || '', s.in_distance_m ?? '', gps(s.in_lat, s.in_lng),
         s.out_site || '', s.out_distance_m ?? '', gps(s.out_lat, s.out_lng),
         deviceName(s.in_device_label, s.in_device_key) || '', deviceName(s.out_device_label, s.out_device_key) || '',
-        [s.in_selfie && 'in', s.out_selfie && 'out'].filter(Boolean).join('+') || '',
         String(s.flags || '').split(',').filter(Boolean).map((f) => FLAG_LABELS[f] || f).join('; '),
         s.id,
       ]);
     }
-    sendCsv(res, `attendance-detail-${ym}.csv`, rows);
+    return sendCsv(c, `attendance-detail-${ym}.csv`, rows);
   });
-
-  return router;
-};
+}

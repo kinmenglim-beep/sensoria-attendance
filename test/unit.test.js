@@ -1,14 +1,14 @@
-'use strict';
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
-process.env.APP_TZ = 'Asia/Kuala_Lumpur';
-const test = require('node:test');
-const assert = require('node:assert/strict');
+import * as time from '../src/time.js';
+import { checkGeofence, ipAllowed, distanceMeters } from '../src/verify.js';
+import { toCsv } from '../src/csv.js';
+import { html } from '../src/views.js';
+import { describeDevice } from '../src/device.js';
+import { hashSecret, verifySecret } from '../src/auth.js';
 
-const time = require('../src/time');
-const { checkGeofence, ipAllowed, distanceMeters } = require('../src/verify');
-const { toCsv } = require('../src/csv');
-const { html } = require('../src/views');
-const { describeDevice } = require('../src/device');
+time.setTimeZone('Asia/Kuala_Lumpur');
 
 test('local time conversions use the app time zone', () => {
   assert.equal(time.localToUtcIso('2026-10-05', '09:00'), '2026-10-05T01:00:00.000Z');
@@ -63,4 +63,12 @@ test('device descriptions from user agents and client hints', () => {
     describeDevice('Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-A515F) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0 Mobile Safari/537.36', { standalone: true }),
     'SAMSUNG SM-A515F · Android 13 · Samsung Internet (home-screen app)',
   );
+});
+
+test('PIN/password hashing round-trips and rejects wrong secrets', async () => {
+  const h = await hashSecret('1234');
+  assert.match(h, /^pbkdf2\$\d+\$/);
+  assert.equal(await verifySecret('1234', h), true);
+  assert.equal(await verifySecret('1235', h), false);
+  assert.equal(await verifySecret('1234', 'garbage'), false);
 });

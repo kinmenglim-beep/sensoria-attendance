@@ -1,5 +1,3 @@
-'use strict';
-
 // Tiny HTML templating: every interpolated value is escaped unless it is
 // itself the result of html`` (or raw()).
 
@@ -9,7 +7,7 @@ class Raw {
 }
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
+export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
 
 function render(v) {
   if (v === null || v === undefined || v === false) return '';
@@ -18,15 +16,15 @@ function render(v) {
   return esc(v);
 }
 
-function html(strings, ...values) {
+export function html(strings, ...values) {
   let out = strings[0];
   for (let i = 0; i < values.length; i++) out += render(values[i]) + strings[i + 1];
   return new Raw(out);
 }
 
-const raw = (s) => new Raw(s);
+export const raw = (s) => new Raw(s);
 
-const FLAG_LABELS = {
+export const FLAG_LABELS = {
   'in:no_location': 'No GPS at check-in',
   'out:no_location': 'No GPS at check-out',
   'in:outside_area': 'Checked in outside area',
@@ -50,22 +48,22 @@ const FLAG_LABELS = {
 // Device flags are only shown to supervisors.
 const SUPERVISOR_ONLY = (f) => f.includes('device');
 
-function flagList(flags, { forWorker = false } = {}) {
+export function flagList(flags, { forWorker = false } = {}) {
   const list = String(flags || '').split(',').filter((f) => f && !(forWorker && SUPERVISOR_ONLY(f)));
   if (!list.length) return '';
   const content = html`${list.map((f) => html`<span class="flag">${FLAG_LABELS[f] || f}</span>`)}`;
   return forWorker ? html`<div>${content}</div>` : content;
 }
 
-function statusBadge(shift) {
+export function statusBadge(shift) {
   if (!shift.check_out_at) return html`<span class="badge badge-open">Working</span>`;
   const cls = { pending: 'badge-pending', approved: 'badge-approved', rejected: 'badge-rejected' }[shift.status];
   const label = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected' }[shift.status];
   return html`<span class="badge ${cls}">${label}</span>`;
 }
 
-const fmtHours = (h) => (Math.round(h * 100) / 100).toFixed(2);
-const fmtMoney = (n) => (n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+export const fmtHours = (h) => (Math.round(h * 100) / 100).toFixed(2);
+export const fmtMoney = (n) => (n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 
 function nav(user, active) {
   if (!user) return '';
@@ -92,7 +90,7 @@ function nav(user, active) {
     </nav>`;
 }
 
-function layout({ title, user = null, active = '', flash = null, error = null, warning = null, body, scripts = [] }) {
+export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [] }) {
   return html`<!doctype html>
 <html lang="en">
 <head>
@@ -107,7 +105,6 @@ function layout({ title, user = null, active = '', flash = null, error = null, w
 <body>
   ${nav(user, active)}
   <main class="container">
-    ${warning ? html`<div class="alert alert-error" role="alert"><strong>⚠ ${warning}</strong></div>` : ''}
     ${flash ? html`<div class="alert alert-ok" role="status">${flash}</div>` : ''}
     ${error ? html`<div class="alert alert-error" role="alert">${error}</div>` : ''}
     ${body}
@@ -118,4 +115,3 @@ function layout({ title, user = null, active = '', flash = null, error = null, w
 </html>`.s;
 }
 
-module.exports = { html, raw, esc, layout, flagList, statusBadge, fmtHours, fmtMoney, FLAG_LABELS };

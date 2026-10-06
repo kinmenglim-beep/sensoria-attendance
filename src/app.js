@@ -1,85 +1,80 @@
-'use strict';
+import { Hono } from 'hono';
 
-const fs = require('node:fs');
-const path = require('node:path');
-const express = require('express');
+import { ensureSchema } from './db.js';
+import * as auth from './auth.js';
+import { html, layout } from './views.js';
+import { DEFAULT_TZ, setTimeZone } from './time.js';
+import { envVar } from './env.js';
+import { registerWorkerRoutes } from './routes/worker.js';
+import { registerAdminRoutes } from './routes/admin.js';
 
-const { openDb } = require('./db');
-const auth = require('./auth');
-const { html, layout } = require('./views');
-const workerRoutes = require('./routes/worker');
-const adminRoutes = require('./routes/admin');
+/**
+ * @param {object} opts
+ * @param {(c) => object} opts.dbFor       returns the async DB for a request
+ * @param {(c) => string} opts.getIp       returns the client IP for a request
+ * @param {boolean} [opts.trustProxy]      trust X-Forwarded-Proto for HTTPS detection
+ * @param {Function} [opts.assets]        optional middleware serving public/ (Node only;
+ *                                         on Cloudflare the platform serves static files)
+ */
+export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
+  const app = new Hono();
+  let schemaReady = null;
 
-function createApp({ dbPath, dataDir, storageWarning = null }) {
-  const db = openDb(dbPath);
-  const selfieDir = path.join(dataDir, 'selfies');
-  fs.mkdirSync(selfieDir, { recursive: true });
-  const limiter = new auth.LoginLimiter();
-
-  const app = express();
-  app.disable('x-powered-by');
-  if (process.env.TRUST_PROXY) {
-    const v = process.env.TRUST_PROXY;
-    app.set('trust proxy', v === 'true' ? true : /^\d+$/.test(v) ? Number(v) : v);
-  } else if (process.env.RAILWAY_ENVIRONMENT) {
-    // Railway terminates HTTPS at its proxy, one hop in front of the app.
-    app.set('trust proxy', 1);
-  }
-
-  app.use((req, res, next) => {
-    res.set({
-      'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'same-origin',
-      'Permissions-Policy': 'geolocation=(self), camera=(self)',
-      'Content-Security-Policy':
-        "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; form-action 'self'",
-    });
-    next();
+  app.use(async (c, next) => {
+    await next();
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Referrer-Policy', 'same-origin');
+    c.header('Permissions-Policy', 'geolocation=(self), camera=()');
+    c.header('Content-Security-Policy',
+      "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; form-action 'self'");
   });
 
-  app.get('/healthz', (req, res) => {
-    db.prepare('SELECT 1').get();
-    res.type('text').send('ok');
-  });
-
-  app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: '1h' }));
-  app.use(express.urlencoded({ extended: false, limit: '100kb' }));
-  app.use('/api', express.json({ limit: '3mb' }));
+  app.get('/healthz', (c) => c.text('ok'));
+  if (assets) app.use(assets);
 
   // Reject cross-site form posts (defence in depth on top of SameSite cookies).
-  app.use((req, res, next) => {
-    if (req.method === 'GET' || req.method === 'HEAD') return next();
-    const src = req.headers.origin || req.headers.referer;
+  app.use(async (c, next) => {
+    if (c.req.method === 'GET' || c.req.method === 'HEAD') return next();
+    const src = c.req.header('origin') || c.req.header('referer');
     if (src) {
       let host = null;
       try { host = new URL(src).host; } catch { /* malformed */ }
-      if (host !== req.headers.host) return res.status(403).send('Cross-site request blocked');
+      if (host !== new URL(c.req.url).host) return c.text('Cross-site request blocked', 403);
     }
-    next();
+    return next();
   });
 
-  app.use((req, res, next) => {
-    req.user = auth.sessionUser(db, req);
-    next();
+  app.use(async (c, next) => {
+    setTimeZone(envVar(c, 'APP_TZ') || DEFAULT_TZ);
+    const db = dbFor(c);
+    if (!schemaReady) schemaReady = ensureSchema(db).catch((err) => { schemaReady = null; throw err; });
+    await schemaReady;
+    c.set('db', db);
+    c.set('ip', getIp(c) || '');
+    c.set('secure', auth.isSecure(c, trustProxy));
+    c.set('user', await auth.sessionUser(c, db));
+    return next();
   });
 
-  const ctx = { db, selfieDir, render: renderPage };
+  function render(c, opts, status = 200) {
+    const user = c.get('user');
+    const flash = opts.flash !== undefined ? opts.flash : (c.req.query('ok') ?? null);
+    return c.html(layout({ user, ...opts, flash }), status);
+  }
 
-  function renderPage(res, opts, status = 200) {
-    const req = res.req;
-    const flash = opts.flash !== undefined ? opts.flash : (typeof req.query.ok === 'string' ? req.query.ok : null);
-    const warning = storageWarning && req.user && req.user.role === 'supervisor' ? storageWarning : null;
-    res.status(status).type('html').send(layout({ user: req.user, ...opts, flash, warning }));
+  /** Parsed form body; repeated fields (e.g. ids) come back as arrays. */
+  async function form(c) {
+    return c.req.parseBody({ all: true });
   }
 
   // ---------- Login / logout / first-run setup ----------
 
-  const hasSupervisor = () => !!db.prepare("SELECT 1 FROM users WHERE role = 'supervisor' LIMIT 1").get();
+  const hasSupervisor = async (db) => !!(await db.get("SELECT 1 AS x FROM users WHERE role = 'supervisor' LIMIT 1"));
   const homeFor = (user) => (user.role === 'supervisor' ? '/admin' : '/');
 
-  function loginPage(res, { error = null, login = '' } = {}, status = 200) {
-    renderPage(res, {
+  function loginPage(c, { error = null, login = '' } = {}, status = 200) {
+    return render(c, {
       title: 'Sign in',
       error,
       body: html`
@@ -99,37 +94,40 @@ function createApp({ dbPath, dataDir, storageWarning = null }) {
     }, status);
   }
 
-  app.get('/login', (req, res) => {
-    if (!hasSupervisor()) return res.redirect('/setup');
-    if (req.user) return res.redirect(homeFor(req.user));
-    loginPage(res);
+  app.get('/login', async (c) => {
+    if (!(await hasSupervisor(c.get('db')))) return c.redirect('/setup');
+    const user = c.get('user');
+    if (user) return c.redirect(homeFor(user));
+    return loginPage(c);
   });
 
-  app.post('/login', (req, res) => {
-    const login = String(req.body.login || '').trim();
-    const secret = String(req.body.secret || '');
-    const ip = req.ip;
-    const locked = limiter.lockedFor(ip, login);
+  app.post('/login', async (c) => {
+    const db = c.get('db');
+    const b = await form(c);
+    const login = String(b.login || '').trim();
+    const secret = String(b.secret || '');
+    const ip = c.get('ip');
+    const locked = await auth.loginLockedFor(db, ip, login);
     if (locked) {
-      return loginPage(res, { login, error: `Too many attempts. Try again in ${Math.ceil(locked / 60000)} minutes.` }, 429);
+      return loginPage(c, { login, error: `Too many attempts. Try again in ${Math.ceil(locked / 60000)} minutes.` }, 429);
     }
-    const user = db.prepare('SELECT * FROM users WHERE login = ? AND active = 1').get(login);
-    if (!user || !auth.verifySecret(secret, user.secret_hash)) {
-      limiter.fail(ip, login);
-      return loginPage(res, { login, error: 'Incorrect login or PIN/password.' }, 401);
+    const user = await db.get('SELECT * FROM users WHERE login = ? AND active = 1', login);
+    if (!user || !(await auth.verifySecret(secret, user.secret_hash))) {
+      await auth.recordLoginFailure(db, ip, login);
+      return loginPage(c, { login, error: 'Incorrect login or PIN/password.' }, 401);
     }
-    limiter.succeed(ip, login);
-    auth.createSession(db, req, res, user);
-    res.redirect(homeFor(user));
+    await auth.clearLoginFailures(db, ip, login);
+    await auth.createSession(c, db, user, { secure: c.get('secure') });
+    return c.redirect(homeFor(user));
   });
 
-  app.post('/logout', (req, res) => {
-    auth.destroySession(db, req, res);
-    res.redirect('/login');
+  app.post('/logout', async (c) => {
+    await auth.destroySession(c, c.get('db'));
+    return c.redirect('/login');
   });
 
-  function setupPage(res, { error = null, values = {} } = {}, status = 200) {
-    renderPage(res, {
+  function setupPage(c, { error = null, values = {} } = {}, status = 200) {
+    return render(c, {
       title: 'First-time setup',
       error,
       body: html`
@@ -148,64 +146,61 @@ function createApp({ dbPath, dataDir, storageWarning = null }) {
     }, status);
   }
 
-  app.get('/setup', (req, res) => {
-    if (hasSupervisor()) return res.redirect('/login');
-    setupPage(res);
+  app.get('/setup', async (c) => {
+    if (await hasSupervisor(c.get('db'))) return c.redirect('/login');
+    return setupPage(c);
   });
 
-  app.post('/setup', (req, res) => {
-    if (hasSupervisor()) return res.redirect('/login');
-    const name = String(req.body.name || '').trim();
-    const login = String(req.body.login || '').trim();
-    const secret = String(req.body.secret || '');
+  app.post('/setup', async (c) => {
+    const db = c.get('db');
+    if (await hasSupervisor(db)) return c.redirect('/login');
+    const b = await form(c);
+    const name = String(b.name || '').trim();
+    const login = String(b.login || '').trim();
+    const secret = String(b.secret || '');
     if (!name || !login || secret.length < 8) {
-      return setupPage(res, { error: 'Fill in all fields; password must be at least 8 characters.', values: { name, login } }, 400);
+      return setupPage(c, { error: 'Fill in all fields; password must be at least 8 characters.', values: { name, login } }, 400);
     }
-    const r = db.prepare("INSERT INTO users (name, login, secret_hash, role) VALUES (?, ?, ?, 'supervisor')")
-      .run(name, login, auth.hashSecret(secret));
-    auth.createSession(db, req, res, { id: Number(r.lastInsertRowid), role: 'supervisor' });
-    res.redirect('/admin/people?ok=' + encodeURIComponent('Supervisor created. Now add your workers.'));
+    const r = await db.run("INSERT INTO users (name, login, secret_hash, role) VALUES (?, ?, ?, 'supervisor')",
+      name, login, await auth.hashSecret(secret));
+    await auth.createSession(c, db, { id: r.lastId, role: 'supervisor' }, { secure: c.get('secure') });
+    return c.redirect('/admin/people?ok=' + encodeURIComponent('Supervisor created. Now add your workers.'));
   });
 
   // ---------- Role gates ----------
 
-  ctx.requireWorker = (req, res, next) => {
-    if (!req.user) return req.path.startsWith('/api/') ? res.status(401).json({ error: 'Please sign in again.' }) : res.redirect('/login');
-    if (req.user.role !== 'worker') return req.path.startsWith('/api/') ? res.status(403).json({ error: 'Workers only.' }) : res.redirect('/admin');
-    next();
-  };
-  ctx.requireSupervisor = (req, res, next) => {
-    if (!req.user) return res.redirect('/login');
-    if (req.user.role !== 'supervisor') return res.redirect('/');
-    next();
-  };
+  const isApi = (c) => c.req.path.startsWith('/api/');
+  async function requireWorker(c, next) {
+    const user = c.get('user');
+    if (!user) return isApi(c) ? c.json({ error: 'Please sign in again.' }, 401) : c.redirect('/login');
+    if (user.role !== 'worker') return isApi(c) ? c.json({ error: 'Workers only.' }, 403) : c.redirect('/admin');
+    return next();
+  }
+  async function requireSupervisor(c, next) {
+    const user = c.get('user');
+    if (!user) return c.redirect('/login');
+    if (user.role !== 'supervisor') return c.redirect('/');
+    return next();
+  }
 
-  // Selfies are private: supervisors, or the worker who took it.
-  app.get('/selfies/:file', (req, res) => {
-    const file = req.params.file;
-    if (!req.user || !/^[a-f0-9]{32}\.jpg$/.test(file)) return res.sendStatus(404);
-    if (req.user.role !== 'supervisor') {
-      const own = db.prepare('SELECT 1 FROM shifts WHERE user_id = ? AND (in_selfie = ? OR out_selfie = ?)').get(req.user.id, file, file);
-      if (!own) return res.sendStatus(404);
-    }
-    res.set('Cache-Control', 'private, max-age=86400');
-    res.sendFile(path.join(selfieDir, file), (err) => { if (err && !res.headersSent) res.sendStatus(404); });
-  });
+  const helpers = { render, form, requireWorker, requireSupervisor };
+  registerWorkerRoutes(app, helpers);
+  registerAdminRoutes(app, helpers);
 
-  app.use(workerRoutes(ctx));
-  app.use(adminRoutes(ctx));
+  app.notFound((c) => render(c, {
+    title: 'Not found',
+    body: html`<div class="card"><h1>Page not found</h1><p><a href="/">Go home</a></p></div>`,
+  }, 404));
 
-  app.use((req, res) => renderPage(res, { title: 'Not found', body: html`<div class="card"><h1>Page not found</h1><p><a href="/">Go home</a></p></div>` }, 404));
-
-  // eslint-disable-next-line no-unused-vars
-  app.use((err, req, res, next) => {
+  app.onError((err, c) => {
     console.error(err);
-    if (req.path.startsWith('/api/')) return res.status(err.status || 500).json({ error: 'Something went wrong. Please try again.' });
-    renderPage(res, { title: 'Error', body: html`<div class="card"><h1>Something went wrong</h1><p>Please go back and try again.</p></div>` }, err.status || 500);
+    if (isApi(c)) return c.json({ error: 'Something went wrong. Please try again.' }, 500);
+    return c.html(layout({
+      title: 'Error',
+      user: null,
+      body: html`<div class="card"><h1>Something went wrong</h1><p>Please go back and try again.</p></div>`,
+    }), 500);
   });
 
-  app.locals.db = db;
   return app;
 }
-
-module.exports = { createApp };

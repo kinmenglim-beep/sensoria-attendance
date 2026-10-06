@@ -3,16 +3,23 @@
   "version": "1.0.0",
   "description": "Simple web-based check-in / check-out system for part-time and gig workers, with supervisor approval and monthly CSV export.",
   "private": true,
-  "main": "src/index.js",
+  "main": "src/cloudflare.js",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning src/index.js",
-    "dev": "node --disable-warning=ExperimentalWarning --watch src/index.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "start": "node --disable-warning=ExperimentalWarning src/node.js",
+    "start:dev": "node --disable-warning=ExperimentalWarning --watch src/node.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
   },
   "engines": {
     "node": ">=22.13"
   },
+  "type": "module",
   "dependencies": {
-    "express": "^5.2.1"
+    "@hono/node-server": "^2.1.3",
+    "hono": "^4.13.13"
+  },
+  "devDependencies": {
+    "wrangler": "^4.147.0"
   }
 }

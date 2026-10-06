@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sensoria-attendance",
+  "main": "src/cloudflare.js",
+  "compatibility_date": "2025-09-01",
+  // Files in public/ (CSS, scripts, icons) are served directly by Cloudflare.
+  "assets": { "directory": "./public" },
+  // The database. Wrangler creates it automatically on the first deploy.
+  "d1_databases": [
+    { "binding": "DB", "database_name": "sensoria-attendance" }
+  ],
+  "vars": {
+    // Time zone for work dates, display and exports.
+    "APP_TZ": "Asia/Kuala_Lumpur"
+  },
+  "observability": { "enabled": true }
+}

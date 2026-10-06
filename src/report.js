@@ -1,20 +1,18 @@
-'use strict';
+import { daysInMonth, hoursBetween } from './time.js';
+import { DEVICE_COLUMNS, DEVICE_JOINS } from './device.js';
 
-const { daysInMonth, hoursBetween } = require('./time');
-const { DEVICE_COLUMNS, DEVICE_JOINS } = require('./device');
-
-const round2 = (n) => Math.round(n * 100) / 100;
+export const round2 = (n) => Math.round(n * 100) / 100;
 
 /**
  * Monthly roll-up per worker. Only approved hours count towards pay;
  * pending / rejected / still-open shifts are reported separately so
  * management can see what is outstanding.
  */
-function monthReport(db, ym) {
+export async function monthReport(db, ym) {
   const like = `${ym}-%`;
   const nDays = daysInMonth(ym);
 
-  const shifts = db.prepare(`
+  const shifts = await db.all(`
     SELECT s.*, u.name, u.login, u.hourly_rate, r.name AS reviewer_name, ${DEVICE_COLUMNS}
     FROM shifts s
     JOIN users u ON u.id = s.user_id
@@ -22,13 +20,13 @@ function monthReport(db, ym) {
     ${DEVICE_JOINS}
     WHERE s.work_date LIKE ?
     ORDER BY u.name COLLATE NOCASE, s.check_in_at
-  `).all(like);
+  `, like);
 
-  const workers = db.prepare(`
+  const workers = await db.all(`
     SELECT id, name, login, hourly_rate FROM users
     WHERE (role = 'worker' AND active = 1) OR id IN (SELECT user_id FROM shifts WHERE work_date LIKE ?)
     ORDER BY name COLLATE NOCASE
-  `).all(like);
+  `, like);
 
   const byId = new Map();
   for (const w of workers) {
@@ -80,4 +78,3 @@ function monthReport(db, ym) {
   return { ym, nDays, rows, totals, shifts };
 }
 
-module.exports = { monthReport, round2 };

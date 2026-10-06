@@ -1,5 +1,7 @@
 # Attendance: check in/out for part-time and gig workers
 
+> **Using the app?** See **[MANUAL.md](MANUAL.md)** for the links and the worker and admin guides.
+
 A small web app that runs in the phone browser, so there is nothing to install. Workers clock in and out.
 Supervisors approve shifts and see who is missing. Management downloads a monthly CSV for payroll.
 

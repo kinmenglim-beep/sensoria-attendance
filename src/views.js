@@ -33,15 +33,24 @@ const FLAG_LABELS = {
   'out:outside_area': 'Checked out outside area',
   'in:off_network': 'Check-in not on venue WiFi',
   'out:off_network': 'Check-out not on venue WiFi',
+  'in:new_device': 'New device at check-in',
+  'out:new_device': 'New device at check-out',
+  'in:shared_device': 'Device also used by another worker',
+  'out:shared_device': 'Check-out device also used by another worker',
+  'out:device_changed': 'Clocked out on a different device',
   no_checkout: 'Never clocked out',
   manual: 'Added by supervisor',
   edited: 'Times edited',
 };
 
-function flagList(flags) {
-  const list = String(flags || '').split(',').filter(Boolean);
+// Device flags are only shown to supervisors.
+const SUPERVISOR_ONLY = (f) => f.includes('device');
+
+function flagList(flags, { forWorker = false } = {}) {
+  const list = String(flags || '').split(',').filter((f) => f && !(forWorker && SUPERVISOR_ONLY(f)));
   if (!list.length) return '';
-  return html`${list.map((f) => html`<span class="flag">${FLAG_LABELS[f] || f}</span>`)}`;
+  const content = html`${list.map((f) => html`<span class="flag">${FLAG_LABELS[f] || f}</span>`)}`;
+  return forWorker ? html`<div>${content}</div>` : content;
 }
 
 function statusBadge(shift) {

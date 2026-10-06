@@ -66,6 +66,22 @@
     });
   }
 
+  // Identify this phone/browser: a saved device key plus whatever model info the browser offers.
+  async function deviceInfo() {
+    const info = {
+      standalone: window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true,
+    };
+    try { info.deviceKey = localStorage.getItem('deviceKey') || undefined; } catch { /* storage blocked */ }
+    if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+      try {
+        const h = await navigator.userAgentData.getHighEntropyValues(['model', 'platformVersion']);
+        info.deviceModel = h.model || undefined;
+        info.platformVersion = h.platformVersion || undefined;
+      } catch { /* not available */ }
+    }
+    return info;
+  }
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const body = { action: form.dataset.action, note: form.elements.note.value };
@@ -90,6 +106,7 @@
           // In "flag" mode we still let them clock in; the supervisor sees a flag.
         }
       }
+      Object.assign(body, await deviceInfo());
       say('Saving…');
       const res = await fetch('/api/clock', {
         method: 'POST',
@@ -100,6 +117,7 @@
       const data = await res.json().catch(() => ({}));
       if (res.status === 401) { window.location.href = '/login'; return; }
       if (!res.ok) throw new Error(data.error || 'Something went wrong. Please try again.');
+      if (data.deviceKey) { try { localStorage.setItem('deviceKey', data.deviceKey); } catch { /* ignore */ } }
       say(data.message, 'success');
       setTimeout(() => window.location.reload(), 1800);
     } catch (err) {

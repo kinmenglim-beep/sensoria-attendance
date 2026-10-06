@@ -7,23 +7,23 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 
 **Workers** (on their phone)
 - Sign in with their phone number or staff ID and a PIN. They stay signed in for 60 days.
-- One big **Clock IN / Clock OUT** button. The phone records GPS location and a selfie, depending on the settings.
+- One big **Clock IN / Clock OUT** button. The phone records GPS location and which device was used (and a selfie, if enabled).
 - **My hours**: each shift with check-in/out times, hours, status, who approved it and when, plus monthly totals and an estimated pay.
 
 **Supervisors**
 - **Dashboard** for any day: who is *working now*, *clocked out* or *not clocked in*. It also lists shifts waiting for approval, with tick boxes to approve many at once.
 - Alerts for workers who **never clocked out** and for approvals left over from earlier days.
-- **Shift detail**: selfie, distance from the venue with a map link, IP address, flags, and a full history (audit log).
+- **Shift detail**: distance from the venue with a map link, the device used, IP address, flags, and a full history (audit log).
   From here a supervisor can approve, reject (with a reason the worker can see), or correct the times.
 - **Add shift manually** for a worker who couldn't clock in (dead phone and so on).
-- **People**: add workers and supervisors, set hourly rates, reset PINs, deactivate leavers.
+- **People**: add workers and supervisors, set hourly rates, reset PINs, deactivate leavers. Each worker's page lists the devices they've used.
 - **Settings**: verification options and work sites (geofences).
 
 **Monthly export** (Export page)
 - **Summary CSV**: one row per worker with days worked, shifts, approved, pending and rejected hours, rate, and approved pay.
   It also has a column for each day of the month with that day's approved hours, plus a TOTAL row. Every worker is in a single table.
 - **Detailed CSV**: one row per shift with date, check-in, check-out, hours, status, approved/rejected by, approval timestamp,
-  notes, GPS distance and coordinates, selfie taken, and flags.
+  notes, GPS distance and coordinates, check-in/out device, and flags.
 - Only **approved** hours count as payable. Pending and rejected hours are shown separately.
 
 ## Verification: what's recommended
@@ -31,12 +31,29 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 | Method | How it works | Effort for workers | Cheating resistance | Notes |
 |---|---|---|---|---|
 | **GPS geofence** ✅ | The phone's location is compared with your venue(s) | None (one-time "allow location") | Medium | Works on any phone. Indoor GPS can be off by 20–100 m, so use a 100–200 m radius. |
-| **Selfie** ✅ | Front-camera photo at check-in | One tap | High (stops buddy-punching) | Photos are small (~50 KB) and visible only to supervisors and the worker. |
+| **Device check** ✅ | Each phone/browser gets a permanent anonymous device ID | None | Medium (catches buddy-punching) | Always on. Only supervisors can see it. |
+| **Selfie** | Front-camera photo at check-in | One tap | High | Off by default. Turn it on in Settings if needed. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
-**Default setup: GPS in "flag" mode plus a selfie at check-in.** Nobody is ever blocked from clocking in, even when GPS is
+**Default setup: GPS in "flag" mode plus the device check.** Nobody is ever blocked from clocking in, even when GPS is
 flaky indoors. Anything unusual is flagged so the supervisor can review it before approving. If people start abusing
-it, switch GPS to "block" in Settings. Add the WiFi check only if the venue has a fixed IP and everyone uses the WiFi.
+it, switch GPS to "block" or turn on selfies in Settings.
+
+### Device check
+
+Browsers don't reveal a phone's real name (e.g. "Ali's iPhone"). Instead, the first time a phone clocks in it gets a
+random device ID, stored as a cookie with a backup copy in the browser. The supervisor sees a description such as
+`iPhone · iOS 17.5 · Safari #7KrwTr` or `SM-A515F · Android 13 · Chrome #Qx81aB`. The `#code` tells apart two
+phones of the same model.
+
+Automatic flags, **visible to supervisors only**:
+- **New device**: the worker clocked in/out on a device they haven't used before.
+- **Device also used by another worker**: someone may be clocking in for a friend on their own phone.
+- **Clocked out on a different device**: the check-out phone differs from the check-in phone.
+
+The shift page shows who else used the same device, and each worker's page on **People** lists every device they've
+used. Workers never see any of this. Keep in mind a "new device" can be innocent: a new phone, cleared browser data,
+private/incognito mode, a different browser, or iPhone "Add to Home Screen" (which counts as a separate browser).
 
 ## Running it
 
@@ -75,11 +92,11 @@ Back up the `data/` folder, which holds the database and selfies, regularly.
 
 ## How a day works
 
-1. A worker opens the site, takes a selfie and taps **Clock IN**. Location is recorded and checked against the venue.
+1. A worker opens the site and taps **Clock IN**. Location and device are recorded and checked.
 2. The supervisor dashboard shows them under **Working now**. Anyone who hasn't arrived is under **Not clocked in**.
 3. The worker taps **Clock OUT**, and the shift appears in **Check-ins today** as *Pending*.
 4. At the end of the day, the supervisor ticks the shifts and taps **Approve selected**.
-   Flagged shifts (outside the area, no GPS, edited) can be opened first to check the selfie and map.
+   Flagged shifts (outside the area, no GPS, new or shared device, edited) can be opened first to check the details.
 5. If someone forgets to clock out, they can still clock in the next day. The forgotten shift is closed at 0 h and
    flagged **Never clocked out**, and it can't be approved until a supervisor enters the real finish time.
 6. At month end, management downloads the CSVs from **Export**.
@@ -92,4 +109,4 @@ npm test      # unit and end-to-end tests
 ```
 
 Code layout: `src/app.js` (server and login), `src/routes/worker.js`, `src/routes/admin.js`, `src/report.js` (monthly
-totals), `src/verify.js` (geofence and IP), `public/` (CSS and small scripts).
+totals), `src/verify.js` (geofence and IP), `src/device.js` (device identification), `public/` (CSS and small scripts).

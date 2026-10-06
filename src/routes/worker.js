@@ -12,6 +12,7 @@ const {
 const { checkGeofence, normalizeIp, parseAllowList, ipAllowed } = require('../verify');
 const { html, statusBadge, flagList, fmtHours, fmtMoney } = require('../views');
 const { round2 } = require('../report');
+const { resolveDevice } = require('../device');
 
 const MAX_SELFIE_BYTES = 2 * 1024 * 1024;
 // An open shift older than this is treated as "forgot to clock out".
@@ -147,7 +148,19 @@ module.exports = function workerRoutes({ db, selfieDir, render, requireWorker })
       flags.push(`${p}:off_network`);
     }
 
-    // 3. Selfie
+    // 3. Device: flag a phone this worker hasn't used before, or one another worker also uses.
+    const device = resolveDevice(db, req, res, req.body);
+    const knownDevices = db.prepare(`
+      SELECT in_device_id AS d FROM shifts WHERE user_id = ? AND in_device_id IS NOT NULL
+      UNION SELECT out_device_id FROM shifts WHERE user_id = ? AND out_device_id IS NOT NULL
+    `).all(uid, uid).map((r) => r.d);
+    if (knownDevices.length && !knownDevices.includes(device.id)) flags.push(`${p}:new_device`);
+    if (db.prepare('SELECT 1 FROM shifts WHERE user_id <> ? AND (in_device_id = ? OR out_device_id = ?) LIMIT 1').get(uid, device.id, device.id)) {
+      flags.push(`${p}:shared_device`);
+    }
+    if (action === 'out' && open.in_device_id && open.in_device_id !== device.id) flags.push('out:device_changed');
+
+    // 4. Selfie
     const needSelfie = s.selfie === 'both' || (s.selfie === 'in' && action === 'in');
     let selfieBuf = null;
     if (req.body.selfie) {
@@ -174,24 +187,26 @@ module.exports = function workerRoutes({ db, selfieDir, render, requireWorker })
             audit(db, forgotten.id, null, 'auto_closed', 'Worker never clocked out; a supervisor needs to enter the check-out time');
           }
           const r = db.prepare(`
-            INSERT INTO shifts (user_id, work_date, check_in_at, in_lat, in_lng, in_accuracy, in_site, in_distance_m, in_selfie, in_ip, flags, worker_note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(uid, localDate(now), now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, selfieFile, ip, addFlags('', ...flags), note);
+            INSERT INTO shifts (user_id, work_date, check_in_at, in_lat, in_lng, in_accuracy, in_site, in_distance_m, in_selfie, in_ip, in_device_id, flags, worker_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(uid, localDate(now), now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, selfieFile, ip, device.id, addFlags('', ...flags), note);
           return Number(r.lastInsertRowid);
         });
         audit(db, id, uid, 'clock_in');
-        return res.json({ ok: true, message: `Clocked in at ${localTime(now)}.${flags.length ? ' Your supervisor will review the location.' : ''}` });
+        // Device flags are for supervisors only, so only location/network issues are mentioned here.
+        const reviewNeeded = flags.some((f) => /no_location|outside_area|off_network/.test(f));
+        return res.json({ ok: true, deviceKey: device.device_key, message: `Clocked in at ${localTime(now)}.${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
       }
 
       const workerNote = [open.worker_note, note].filter(Boolean).join(' / ') || null;
       db.prepare(`
         UPDATE shifts SET check_out_at = ?, out_lat = ?, out_lng = ?, out_accuracy = ?, out_site = ?, out_distance_m = ?,
-          out_selfie = ?, out_ip = ?, flags = ?, worker_note = ?
+          out_selfie = ?, out_ip = ?, out_device_id = ?, flags = ?, worker_note = ?
         WHERE id = ? AND check_out_at IS NULL
-      `).run(now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, selfieFile, ip, addFlags(open.flags, ...flags), workerNote, open.id);
+      `).run(now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, selfieFile, ip, device.id, addFlags(open.flags, ...flags), workerNote, open.id);
       audit(db, open.id, uid, 'clock_out');
       const hrs = hoursBetween(open.check_in_at, now);
-      return res.json({ ok: true, message: `Clocked out at ${localTime(now)} — ${fmtHours(hrs)} h. Waiting for supervisor approval.` });
+      return res.json({ ok: true, deviceKey: device.device_key, message: `Clocked out at ${localTime(now)} — ${fmtHours(hrs)} h. Waiting for supervisor approval.` });
     } catch (err) {
       if (selfieFile) fs.rmSync(path.join(selfieDir, selfieFile), { force: true });
       if (/UNIQUE/.test(err.message)) return res.status(409).json({ error: "You're already clocked in." });
@@ -244,7 +259,7 @@ module.exports = function workerRoutes({ db, selfieDir, render, requireWorker })
                 <div>In ${localTime(x.check_in_at)} → Out ${x.check_out_at ? localTime(x.check_out_at) : '—'}${x.check_out_at && localDate(x.check_out_at) !== x.work_date ? html` <small class="muted">(next day)</small>` : ''}</div>
                 ${x.reviewer_name ? html`<div class="muted small">${x.status === 'approved' ? 'Approved' : 'Rejected'} by ${x.reviewer_name} · ${prettyDate(localDate(x.reviewed_at))} ${localTime(x.reviewed_at)}</div>` : ''}
                 ${x.review_note ? html`<div class="small">“${x.review_note}”</div>` : ''}
-                ${x.flags ? html`<div>${flagList(x.flags)}</div>` : ''}
+                ${flagList(x.flags, { forWorker: true })}
               </li>`)}
           </ul>` : html`<p class="muted">No shifts this month.</p>`}
         </section>`,

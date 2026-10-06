@@ -8,6 +8,7 @@ const time = require('../src/time');
 const { checkGeofence, ipAllowed, distanceMeters } = require('../src/verify');
 const { toCsv } = require('../src/csv');
 const { html } = require('../src/views');
+const { describeDevice } = require('../src/device');
 
 test('local time conversions use the app time zone', () => {
   assert.equal(time.localToUtcIso('2026-10-05', '09:00'), '2026-10-05T01:00:00.000Z');
@@ -47,4 +48,19 @@ test('csv escapes quotes, commas and formula injection', () => {
 test('html template escapes interpolated values', () => {
   assert.equal(html`<p>${'<script>'}</p>`.toString(), '<p>&lt;script&gt;</p>');
   assert.equal(html`<p>${html`<b>ok</b>`}</p>`.toString(), '<p><b>ok</b></p>');
+});
+
+test('device descriptions from user agents and client hints', () => {
+  assert.equal(
+    describeDevice('Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'),
+    'iPhone · iOS 17.5 · Safari',
+  );
+  // Chrome on Android hides the model ("K"); client hints fill it in.
+  const reduced = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+  assert.equal(describeDevice(reduced), 'Android 10 · Chrome');
+  assert.equal(describeDevice(reduced, { model: 'SM-S918B', platformVersion: '14.0.0' }), 'SM-S918B · Android 14 · Chrome');
+  assert.equal(
+    describeDevice('Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-A515F) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0 Mobile Safari/537.36', { standalone: true }),
+    'SAMSUNG SM-A515F · Android 13 · Samsung Internet (home-screen app)',
+  );
 });

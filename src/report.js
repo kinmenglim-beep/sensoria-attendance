@@ -1,6 +1,7 @@
 'use strict';
 
 const { daysInMonth, hoursBetween } = require('./time');
+const { DEVICE_COLUMNS, DEVICE_JOINS } = require('./device');
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -14,10 +15,11 @@ function monthReport(db, ym) {
   const nDays = daysInMonth(ym);
 
   const shifts = db.prepare(`
-    SELECT s.*, u.name, u.login, u.hourly_rate, r.name AS reviewer_name
+    SELECT s.*, u.name, u.login, u.hourly_rate, r.name AS reviewer_name, ${DEVICE_COLUMNS}
     FROM shifts s
     JOIN users u ON u.id = s.user_id
     LEFT JOIN users r ON r.id = s.reviewed_by
+    ${DEVICE_JOINS}
     WHERE s.work_date LIKE ?
     ORDER BY u.name COLLATE NOCASE, s.check_in_at
   `).all(like);

@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS sites (
   radius_m INTEGER NOT NULL DEFAULT 150
 );
 
+-- Browsers/phones used to clock in, identified by a random long-lived key.
+CREATE TABLE IF NOT EXISTS devices (
+  id         INTEGER PRIMARY KEY,
+  device_key TEXT NOT NULL UNIQUE,
+  label      TEXT NOT NULL,
+  user_agent TEXT,
+  first_seen TEXT NOT NULL,
+  last_seen  TEXT NOT NULL
+);
+
 -- One row per check-in/check-out pair. Times are stored as UTC ISO strings;
 -- work_date is the local (APP_TZ) date of the check-in.
 CREATE TABLE IF NOT EXISTS shifts (
@@ -45,7 +55,9 @@ CREATE TABLE IF NOT EXISTS shifts (
   check_in_at   TEXT NOT NULL,
   check_out_at  TEXT,
   in_lat REAL, in_lng REAL, in_accuracy REAL, in_site TEXT, in_distance_m REAL, in_selfie TEXT, in_ip TEXT,
+  in_device_id INTEGER REFERENCES devices(id),
   out_lat REAL, out_lng REAL, out_accuracy REAL, out_site TEXT, out_distance_m REAL, out_selfie TEXT, out_ip TEXT,
+  out_device_id INTEGER REFERENCES devices(id),
   flags         TEXT NOT NULL DEFAULT '',
   worker_note   TEXT,
   status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
@@ -73,7 +85,7 @@ const DEFAULT_SETTINGS = {
   // off | flag | block — what to do when GPS is missing or outside every site.
   geofence_mode: 'flag',
   // none | in | both — when a selfie is required.
-  selfie: 'in',
+  selfie: 'none',
   // off | flag | block — what to do when the request doesn't come from the venue network.
   ip_mode: 'off',
   allowed_ips: '',
@@ -84,6 +96,11 @@ function openDb(dbPath) {
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
+  // Upgrade databases created before device tracking existed.
+  const cols = db.prepare('PRAGMA table_info(shifts)').all().map((c) => c.name);
+  for (const col of ['in_device_id', 'out_device_id']) {
+    if (!cols.includes(col)) db.exec(`ALTER TABLE shifts ADD COLUMN ${col} INTEGER REFERENCES devices(id)`);
+  }
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) insert.run(k, v);
   return db;

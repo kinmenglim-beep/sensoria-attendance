@@ -13,17 +13,21 @@ const { localDate } = require('../src/time');
 // A tiny tiny JPEG-looking payload (valid SOI marker, padded).
 const SELFIE = 'data:image/jpeg;base64,' + Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 1)]).toString('base64');
 
-function client(base) {
-  let cookie = '';
+function client(base, { userAgent = 'test-agent' } = {}) {
+  const jar = new Map();
   return async function req(method, url, { form, json } = {}) {
-    const headers = { origin: base };
+    const headers = { origin: base, 'user-agent': userAgent };
     let body;
-    if (cookie) headers.cookie = cookie;
+    if (jar.size) headers.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
     if (form) { headers['content-type'] = 'application/x-www-form-urlencoded'; body = new URLSearchParams(form).toString(); }
     if (json) { headers['content-type'] = 'application/json'; body = JSON.stringify(json); }
     const res = await fetch(base + url, { method, headers, body, redirect: 'manual' });
-    const set = res.headers.get('set-cookie');
-    if (set) cookie = set.split(';')[0];
+    for (const c of res.headers.getSetCookie()) {
+      const [pair] = c.split(';');
+      const i = pair.indexOf('=');
+      const v = pair.slice(i + 1);
+      if (v && !/Expires=Thu, 01 Jan 1970/i.test(c)) jar.set(pair.slice(0, i), v); else jar.delete(pair.slice(0, i));
+    }
     const text = await res.text();
     return { status: res.status, location: res.headers.get('location'), text, headers: res.headers };
   };
@@ -50,6 +54,8 @@ test('end-to-end: setup, clock in/out, approve, export', async (t) => {
   assert.equal(r.status, 302);
   r = await sup('POST', '/admin/sites', { form: { name: 'Venue', lat: '3.139', lng: '101.6869', radius_m: '150' } });
   assert.equal(r.status, 302);
+  // Selfies are off by default; turn them on to exercise that path.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'flag', selfie: 'in', ip_mode: 'off', allowed_ips: '' } });
 
   // Cross-site posts are blocked.
   const evil = await fetch(base + '/admin/sites', { method: 'POST', headers: { origin: 'https://evil.example' }, redirect: 'manual' });
@@ -63,7 +69,7 @@ test('end-to-end: setup, clock in/out, approve, export', async (t) => {
   r = await wkr('GET', '/');
   assert.match(r.text, /not clocked in/);
 
-  // Selfie required at check-in by default.
+  // Selfie required at check-in when enabled.
   r = await wkr('POST', '/api/clock', { json: { action: 'in', lat: 3.1391, lng: 101.6869, accuracy: 10 } });
   assert.equal(r.status, 400);
   r = await wkr('POST', '/api/clock', { json: { action: 'in', lat: 3.1391, lng: 101.6869, accuracy: 10, selfie: SELFIE } });
@@ -218,4 +224,76 @@ test('a forgotten clock-out is auto-closed and must be fixed before approval', a
   assert.equal(fixed.status, 'approved');
   assert.equal(fixed.flags, 'edited');
   assert.equal(Math.round((Date.parse(fixed.check_out_at) - Date.parse(fixed.check_in_at)) / 3600000), 6);
+});
+
+test('devices: new, shared and changed devices are flagged for supervisors only', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attendance-'));
+  const app = createApp({ dbPath: path.join(dir, 'test.db'), dataDir: dir });
+  const server = app.listen(0);
+  t.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const db = app.locals.db;
+  const flagsOf = (id) => db.prepare('SELECT flags FROM shifts WHERE id = ?').get(id).flags;
+  const lastId = () => db.prepare('SELECT MAX(id) AS id FROM shifts').get().id;
+
+  const sup = client(base);
+  await sup('POST', '/setup', { form: { name: 'S', login: 's', secret: 'password1' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', selfie: 'none', ip_mode: 'off', allowed_ips: '' } });
+  await sup('POST', '/admin/people', { form: { name: 'Alice', login: 'alice', role: 'worker', secret: '1111' } });
+  await sup('POST', '/admin/people', { form: { name: 'Bob', login: 'bob', role: 'worker', secret: '2222' } });
+
+  const iphoneUa = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+  const alicePhone = client(base, { userAgent: iphoneUa });
+  await alicePhone('POST', '/login', { form: { login: 'alice', secret: '1111' } });
+
+  // First ever check-in: nothing to compare against, so no flag.
+  let r = await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 200);
+  assert.ok(JSON.parse(r.text).deviceKey);
+  await alicePhone('POST', '/api/clock', { json: { action: 'out' } });
+  assert.equal(flagsOf(lastId()), '');
+
+  // Same phone again: still no flag.
+  await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(flagsOf(lastId()), '');
+
+  // Clocking out from another phone.
+  const otherPhone = client(base, { userAgent: 'Mozilla/5.0 (Linux; Android 13; SM-A515F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36' });
+  await otherPhone('POST', '/login', { form: { login: 'alice', secret: '1111' } });
+  r = await otherPhone('POST', '/api/clock', { json: { action: 'out' } });
+  assert.equal(r.status, 200);
+  assert.equal(flagsOf(lastId()), 'out:new_device,out:device_changed');
+
+  // Bob signs in on Alice's phone (the device cookie survives log-out).
+  await alicePhone('POST', '/logout');
+  await alicePhone('POST', '/login', { form: { login: 'bob', secret: '2222' } });
+  r = await alicePhone('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 200);
+  assert.doesNotMatch(JSON.parse(r.text).message, /device/i);
+  const bobShift = lastId();
+  assert.equal(flagsOf(bobShift), 'in:shared_device');
+
+  // The device key also works from localStorage if the cookie was lost.
+  const aliceKey = db.prepare('SELECT device_key FROM devices WHERE label LIKE ?').get('iPhone%').device_key;
+  const fresh = client(base, { userAgent: iphoneUa });
+  await fresh('POST', '/login', { form: { login: 'alice', secret: '1111' } });
+  await fresh('POST', '/api/clock', { json: { action: 'in', deviceKey: aliceKey } });
+  assert.equal(flagsOf(lastId()), 'in:shared_device');
+
+  // Supervisor sees the device and who else used it.
+  r = await sup('GET', `/admin/shifts/${bobShift}`);
+  assert.match(r.text, /iPhone · iOS 17\.5 · Safari #/);
+  assert.match(r.text, /Also used by: Alice/);
+  r = await sup('GET', '/admin/people/' + db.prepare("SELECT id FROM users WHERE login = 'alice'").get().id);
+  assert.match(r.text, /Devices used/);
+  assert.match(r.text, /SM-A515F · Android 13 · Chrome/);
+  r = await sup('GET', `/admin/export/detail.csv?month=${localDate().slice(0, 7)}`);
+  assert.match(r.text, /Check-in Device/);
+  assert.match(r.text, /Device also used by another worker/);
+
+  // Workers never see device info.
+  r = await alicePhone('GET', '/me');
+  assert.doesNotMatch(r.text, /iPhone|📱|new device|device also used|different device/i);
+  r = await alicePhone('GET', '/');
+  assert.doesNotMatch(r.text, /iPhone|📱|new device|device also used|different device/i);
 });

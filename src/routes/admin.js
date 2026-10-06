@@ -14,6 +14,7 @@ const { normalizeIp } = require('../verify');
 const { html, statusBadge, flagList, fmtHours, fmtMoney, FLAG_LABELS } = require('../views');
 const { monthReport } = require('../report');
 const { toCsv } = require('../csv');
+const { deviceName, DEVICE_COLUMNS, DEVICE_JOINS } = require('../device');
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -62,7 +63,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
                 <tr>
                   <td class="check">${s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
                   ${showDate ? html`<td>${prettyDate(s.work_date)}</td>` : ''}
-                  <td>${s.name}</td>
+                  <td>${s.name}${s.in_device_label ? html`<div class="muted small">📱 ${deviceName(s.in_device_label, s.in_device_key)}</div>` : ''}</td>
                   <td>${localTime(s.check_in_at)}${s.in_selfie ? html` <span title="Selfie taken">📷</span>` : ''}</td>
                   <td>${s.check_out_at ? localTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
@@ -87,8 +88,8 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     const date = isDate(req.query.date) ? req.query.date : today;
     const workers = db.prepare("SELECT id, name, login FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE").all();
     const shifts = db.prepare(`
-      SELECT s.*, u.name, r.name AS reviewer_name FROM shifts s
-      JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by
+      SELECT s.*, u.name, r.name AS reviewer_name, ${DEVICE_COLUMNS} FROM shifts s
+      JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by ${DEVICE_JOINS}
       WHERE s.work_date = ? ORDER BY s.check_in_at
     `).all(date);
 
@@ -174,7 +175,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
   // ---------- All pending approvals ----------
   router.get('/admin/pending', (req, res) => {
     const shifts = db.prepare(`
-      SELECT s.*, u.name FROM shifts s JOIN users u ON u.id = s.user_id
+      SELECT s.*, u.name, ${DEVICE_COLUMNS} FROM shifts s JOIN users u ON u.id = s.user_id ${DEVICE_JOINS}
       WHERE s.status = 'pending' AND s.check_out_at IS NOT NULL
       ORDER BY s.work_date, s.check_in_at
     `).all();
@@ -214,8 +215,8 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
 
   function loadShift(id) {
     return db.prepare(`
-      SELECT s.*, u.name, u.login, r.name AS reviewer_name FROM shifts s
-      JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by
+      SELECT s.*, u.name, u.login, r.name AS reviewer_name, ${DEVICE_COLUMNS} FROM shifts s
+      JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by ${DEVICE_JOINS}
       WHERE s.id = ?
     `).get(Number(id));
   }
@@ -328,6 +329,20 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     res.redirect(withMsg(`/admin/shifts/${id}`, 'Shift added.'));
   });
 
+  /** Device line for the shift page: name, when first seen, and other workers who used it. */
+  function deviceDetail(deviceId, label, key, userId) {
+    if (!deviceId) return html`<p class="muted">📱 Device not recorded</p>`;
+    const dev = db.prepare('SELECT first_seen FROM devices WHERE id = ?').get(deviceId);
+    const others = db.prepare(`
+      SELECT GROUP_CONCAT(DISTINCT u.name) AS names FROM shifts s JOIN users u ON u.id = s.user_id
+      WHERE (s.in_device_id = ? OR s.out_device_id = ?) AND s.user_id <> ?
+    `).get(deviceId, deviceId, userId).names;
+    return html`
+      <p>📱 <strong>${deviceName(label, key)}</strong><br>
+        <span class="muted small">First seen ${localDateTime(dev.first_seen)}</span></p>
+      ${others ? html`<p class="flag">Also used by: ${others.split(',').join(', ')}</p>` : ''}`;
+  }
+
   function shiftDetail(res, shift, { error = null, values = null } = {}, status = 200) {
     const log = db.prepare(`
       SELECT a.*, u.name AS actor FROM audit a LEFT JOIN users u ON u.id = a.actor_id
@@ -387,15 +402,17 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
           <div class="card">
             <h2>Check-in verification</h2>
             <p>${locationSummary(shift.in_site, shift.in_distance_m, shift.in_accuracy, shift.in_lat, shift.in_lng)}</p>
+            ${deviceDetail(shift.in_device_id, shift.in_device_label, shift.in_device_key, shift.user_id)}
             ${shift.in_ip ? html`<p class="muted small">IP ${shift.in_ip}</p>` : ''}
-            ${shift.in_selfie ? html`<img class="selfie" src="/selfies/${shift.in_selfie}" alt="Check-in selfie">` : html`<p class="muted">No selfie</p>`}
+            ${shift.in_selfie ? html`<img class="selfie" src="/selfies/${shift.in_selfie}" alt="Check-in selfie">` : ''}
           </div>
           <div class="card">
             <h2>Check-out verification</h2>
             ${shift.check_out_at ? html`
               <p>${locationSummary(shift.out_site, shift.out_distance_m, shift.out_accuracy, shift.out_lat, shift.out_lng)}</p>
+              ${deviceDetail(shift.out_device_id, shift.out_device_label, shift.out_device_key, shift.user_id)}
               ${shift.out_ip ? html`<p class="muted small">IP ${shift.out_ip}</p>` : ''}
-              ${shift.out_selfie ? html`<img class="selfie" src="/selfies/${shift.out_selfie}" alt="Check-out selfie">` : html`<p class="muted">No selfie</p>`}
+              ${shift.out_selfie ? html`<img class="selfie" src="/selfies/${shift.out_selfie}" alt="Check-out selfie">` : ''}
             ` : html`<p class="muted">Not clocked out yet.</p>`}
           </div>
         </section>
@@ -562,8 +579,38 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
             <label class="checkbox"><input type="checkbox" name="active" value="1" ${(values ? values.active : person.active) ? 'checked' : ''}> Active (can sign in and appears on the dashboard)</label>
             <div><button class="btn btn-primary" type="submit">Save</button></div>
           </form>
-        </section>`,
+        </section>
+        ${person.role === 'worker' ? devicesCard(person) : ''}`,
     }, status);
+  }
+
+  function devicesCard(person) {
+    const devices = db.prepare(`
+      SELECT d.id, d.label, d.device_key, MIN(s.check_in_at) AS first_used, MAX(s.check_in_at) AS last_used, COUNT(DISTINCT s.id) AS shifts,
+        (SELECT GROUP_CONCAT(DISTINCT u2.name) FROM shifts s2 JOIN users u2 ON u2.id = s2.user_id
+          WHERE (s2.in_device_id = d.id OR s2.out_device_id = d.id) AND s2.user_id <> ?) AS others
+      FROM devices d JOIN shifts s ON s.in_device_id = d.id OR s.out_device_id = d.id
+      WHERE s.user_id = ?
+      GROUP BY d.id ORDER BY last_used DESC
+    `).all(person.id, person.id);
+    return html`
+      <section class="card">
+        <h2>Devices used</h2>
+        ${devices.length ? html`
+          <div class="table-wrap"><table>
+            <thead><tr><th>Device</th><th>First used</th><th>Last used</th><th class="num">Shifts</th><th>Also used by</th></tr></thead>
+            <tbody>${devices.map((d) => html`
+              <tr>
+                <td>📱 ${deviceName(d.label, d.device_key)}</td>
+                <td>${localDateTime(d.first_used)}</td><td>${localDateTime(d.last_used)}</td>
+                <td class="num">${d.shifts}</td>
+                <td>${d.others ? html`<span class="flag">${d.others.split(',').join(', ')}</span>` : html`<span class="muted">—</span>`}</td>
+              </tr>`)}
+            </tbody>
+          </table></div>
+          <p class="hint">Only supervisors can see this. A new device can be innocent (new phone, cleared browser data, private browsing), so check with the worker before acting on it.</p>`
+        : html`<p class="muted">No check-ins yet.</p>`}
+      </section>`;
   }
 
   router.get('/admin/people/:id', (req, res) => {
@@ -625,9 +672,9 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
             </label>
             <label>Selfie
               <select name="selfie">
-                ${opt('selfie', 'in', 'At check-in only (recommended)')}
+                ${opt('selfie', 'none', 'Off (recommended: GPS + device check is usually enough)')}
+                ${opt('selfie', 'in', 'At check-in only')}
                 ${opt('selfie', 'both', 'At check-in and check-out')}
-                ${opt('selfie', 'none', 'Off')}
               </select>
             </label>
             <label>Venue WiFi (public IP address)
@@ -678,7 +725,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
     const pick = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
     transaction(db, () => {
       setSetting(db, 'geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag'));
-      setSetting(db, 'selfie', pick(b.selfie, ['none', 'in', 'both'], 'in'));
+      setSetting(db, 'selfie', pick(b.selfie, ['none', 'in', 'both'], 'none'));
       setSetting(db, 'ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off'));
       setSetting(db, 'allowed_ips', String(b.allowed_ips || '').slice(0, 2000));
     });
@@ -800,7 +847,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
       'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out', 'Hours', 'Status',
       'Approved/Rejected By', 'Approved/Rejected At', 'Review Note', 'Worker Note',
       'Check-in Site', 'Check-in Distance (m)', 'Check-in GPS', 'Check-out Site', 'Check-out Distance (m)', 'Check-out GPS',
-      'Selfie', 'Flags', 'Shift ID',
+      'Check-in Device', 'Check-out Device', 'Selfie', 'Flags', 'Shift ID',
     ]];
     const gps = (lat, lng) => (lat == null ? '' : `${lat.toFixed(6)} ${lng.toFixed(6)}`);
     const shifts = [...rep.shifts].sort((a, b) => a.work_date.localeCompare(b.work_date) || a.name.localeCompare(b.name) || a.check_in_at.localeCompare(b.check_in_at));
@@ -815,6 +862,7 @@ module.exports = function adminRoutes({ db, render, requireSupervisor }) {
         s.reviewer_name || '', localDateTime(s.reviewed_at), s.review_note || '', s.worker_note || '',
         s.in_site || '', s.in_distance_m ?? '', gps(s.in_lat, s.in_lng),
         s.out_site || '', s.out_distance_m ?? '', gps(s.out_lat, s.out_lng),
+        deviceName(s.in_device_label, s.in_device_key) || '', deviceName(s.out_device_label, s.out_device_key) || '',
         [s.in_selfie && 'in', s.out_selfie && 'out'].filter(Boolean).join('+') || '',
         String(s.flags || '').split(',').filter(Boolean).map((f) => FLAG_LABELS[f] || f).join('; '),
         s.id,

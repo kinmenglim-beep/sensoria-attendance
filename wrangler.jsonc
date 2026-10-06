@@ -11,7 +11,9 @@
   ],
   "vars": {
     // Time zone for work dates, display and exports.
-    "APP_TZ": "Asia/Kuala_Lumpur"
+    "APP_TZ": "Asia/Kuala_Lumpur",
+    // Clock times are rounded to the nearest N minutes for pay (0 = no rounding).
+    "ROUND_MINUTES": "15"
   },
   "observability": { "enabled": true }
 }

@@ -102,13 +102,22 @@ For long-term records, download the monthly CSVs from **Export**.
 |---|---|---|
 | `APP_TZ` | `Asia/Kuala_Lumpur` | Time zone for work dates, display and exports |
 | `MAX_SHIFT_HOURS` | `16` | An open shift older than this counts as "forgot to clock out" |
+| `ROUND_MINUTES` | `15` | Round clock times to the nearest N minutes for pay; `0` turns rounding off |
 
 ### Self-hosting instead (optional)
 
 The same code also runs on Node.js 22.13+ with a local SQLite file. Use `npm start`, or the included `Dockerfile`
 with persistent storage mounted at `/data`. Environment variables: `PORT` (3000), `APP_TZ`, `DATA_DIR`
-(`./data`), `MAX_SHIFT_HOURS`, and `TRUST_PROXY=1` when running behind a reverse proxy (needed for the real client
+(`./data`), `MAX_SHIFT_HOURS`, `ROUND_MINUTES`, and `TRUST_PROXY=1` when running behind a reverse proxy (needed for the real client
 IP and HTTPS cookies). Serve it over HTTPS.
+
+## Time rounding
+
+Hours are paid on times **rounded to the nearest quarter hour**: up to 7 minutes past rounds down, 8 or more rounds
+up. For example, clocking in at 1:13pm and out at 3:24pm counts as 1:15pm–3:30pm, which is **2h 15m (2.25 h)**.
+The real clock times are always kept. Screens show them with the rounded time in brackets, e.g. `13:13 (13:15)`. The
+detailed CSV has actual times, rounded times, hours (rounded, used for pay) and actual hours. Change the interval with
+`ROUND_MINUTES`. Rounding is applied when hours are calculated, so changing it also changes past months' figures.
 
 ## How a day works
 

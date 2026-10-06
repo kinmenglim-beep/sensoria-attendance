@@ -3,11 +3,11 @@ import {
 } from '../db.js';
 import { hashSecret } from '../auth.js';
 import {
-  localDate, localTime, localDateTime, localToUtcIso, addDays, addMonths, hoursBetween, formatDuration,
+  localDate, localTime, localDateTime, localToUtcIso, addDays, addMonths, hoursBetween, paidHours, roundTime, formatDuration, formatHM, ROUND_MINUTES,
   prettyDate, prettyMonth, isDate, isMonth, isTime, TZ,
 } from '../time.js';
 import { normalizeIp } from '../verify.js';
-import { html, statusBadge, flagList, fmtHours, fmtMoney, FLAG_LABELS } from '../views.js';
+import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime, FLAG_LABELS } from '../views.js';
 import { monthReport } from '../report.js';
 import { toCsv } from '../csv.js';
 import {
@@ -39,7 +39,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   app.use('/admin', requireSupervisor);
   app.use('/admin/*', requireSupervisor);
 
-  const shiftHours = (s) => (s.check_out_at ? hoursBetween(s.check_in_at, s.check_out_at) : null);
+  // Payable hours use check-in/out rounded to the nearest quarter hour.
+  const shiftHours = (s) => (s.check_out_at ? paidHours(s.check_in_at, s.check_out_at) : null);
   // Auto-closed shifts need a real check-out time before they can be approved.
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
   const activeWorkers = (db) => db.all("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
@@ -65,8 +66,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
                   <td class="check">${s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
                   ${showDate ? html`<td>${prettyDate(s.work_date)}</td>` : ''}
                   <td>${s.name}${s.in_device_label ? html`<div class="muted small">📱 ${deviceName(s.in_device_label, s.in_device_key)}</div>` : ''}</td>
-                  <td>${localTime(s.check_in_at)}</td>
-                  <td>${s.check_out_at ? localTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
+                  <td>${clockTime(s.check_in_at)}</td>
+                  <td>${s.check_out_at ? clockTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
                   <td>${flagList(s.flags) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
                   <td>${statusBadge(s)}${s.reviewer_name ? html`<div class="muted small">${s.reviewer_name}</div>` : ''}</td>
@@ -407,7 +408,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <div class="detail-grid">
             <div><span class="label">Check-in</span><strong>${localDateTime(shift.check_in_at)}</strong></div>
             <div><span class="label">Check-out</span><strong>${shift.check_out_at ? localDateTime(shift.check_out_at) : 'Still clocked in'}</strong></div>
-            <div><span class="label">Hours</span><strong>${hrs != null ? fmtHours(hrs) : '—'}</strong></div>
+            <div><span class="label">Hours (for pay)</span><strong>${hrs != null ? html`${fmtHours(hrs)} <span class="muted small">(${formatHM(hrs)})</span>` : '—'}</strong>
+              ${hrs != null && ROUND_MINUTES ? html`<div class="small muted">Counted ${localTime(roundTime(shift.check_in_at))}–${localTime(roundTime(shift.check_out_at))} · actual ${formatHM(hoursBetween(shift.check_in_at, shift.check_out_at))}</div>` : ''}
+            </div>
             <div><span class="label">Status</span>${statusBadge(shift)}
               ${shift.reviewer_name ? html`<div class="small muted">by ${shift.reviewer_name}, ${localDateTime(shift.reviewed_at)}</div>` : ''}
               ${shift.review_note ? html`<div class="small">“${shift.review_note}”</div>` : ''}
@@ -946,7 +949,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const ym = monthParam(c.req.query('month'));
     const rep = await monthReport(c.get('db'), ym);
     const rows = [[
-      'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out', 'Hours', 'Status',
+      'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out',
+      'Check In (rounded)', 'Check Out (rounded)', 'Hours', 'Actual Hours', 'Status',
       'Approved/Rejected By', 'Approved/Rejected At', 'Review Note', 'Worker Note',
       'Check-in Site', 'Check-in Distance (m)', 'Check-in GPS', 'Check-out Site', 'Check-out Distance (m)', 'Check-out GPS',
       'Check-in Device', 'Check-out Device', 'Flags', 'Shift ID',
@@ -959,6 +963,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         new Date(`${s.work_date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' }),
         s.user_id, s.name, s.login,
         localDateTime(s.check_in_at), localDateTime(s.check_out_at),
+        localDateTime(roundTime(s.check_in_at)), localDateTime(roundTime(s.check_out_at)),
+        s.check_out_at ? paidHours(s.check_in_at, s.check_out_at) : '',
         s.check_out_at ? hoursBetween(s.check_in_at, s.check_out_at) : '',
         s.check_out_at ? s.status.charAt(0).toUpperCase() + s.status.slice(1) : 'Not clocked out',
         s.reviewer_name || '', localDateTime(s.reviewed_at), s.review_note || '', s.worker_note || '',

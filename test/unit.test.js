@@ -72,3 +72,21 @@ test('PIN/password hashing round-trips and rejects wrong secrets', async () => {
   assert.equal(await verifySecret('1235', h), false);
   assert.equal(await verifySecret('1234', 'garbage'), false);
 });
+
+test('times round to the nearest quarter hour for pay', () => {
+  const at = (hhmm, ss = '00') => new Date(`${time.localToUtcIso('2026-10-05', hhmm).slice(0, 17)}${ss}.000Z`).toISOString();
+  // The example from the brief: 1:13pm → 1:15pm, 3:24pm → 3:30pm = 2h 15m.
+  assert.equal(time.localTime(time.roundTime(at('13:13'))), '13:15');
+  assert.equal(time.localTime(time.roundTime(at('15:24'))), '15:30');
+  assert.equal(time.paidHours(at('13:13'), at('15:24')), 2.25);
+  assert.equal(time.formatHM(2.25), '2h 15m');
+  // :07 rounds down, :08 rounds up; seconds are ignored (what you see is what counts).
+  assert.equal(time.localTime(time.roundTime(at('09:07', '59'))), '09:00');
+  assert.equal(time.localTime(time.roundTime(at('09:08'))), '09:15');
+  assert.equal(time.localTime(time.roundTime(at('23:53'))), '00:00');
+  // Rounding can be turned off.
+  time.setRounding(0);
+  assert.equal(time.paidHours(at('13:13'), at('15:24')), 2.18);
+  time.setRounding(undefined);
+  assert.equal(time.ROUND_MINUTES, 15);
+});

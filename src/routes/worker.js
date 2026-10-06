@@ -1,10 +1,10 @@
 import { getSettings, auditStmt, addFlags } from '../db.js';
 import { envVar } from '../env.js';
 import {
-  TZ, localDate, localTime, addMonths, hoursBetween, formatDuration, prettyDate, prettyMonth, isMonth,
+  TZ, localDate, localTime, roundTime, addMonths, paidHours, formatDuration, formatHM, prettyDate, prettyMonth, isMonth,
 } from '../time.js';
 import { checkGeofence, normalizeIp, parseAllowList, ipAllowed } from '../verify.js';
-import { html, statusBadge, flagList, fmtHours, fmtMoney } from '../views.js';
+import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { round2 } from '../report.js';
 import { resolveDevice, checkRegistration, recentDeviceCount } from '../device.js';
 
@@ -29,7 +29,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     const today = localDate();
     const todays = await db.all('SELECT * FROM shifts WHERE user_id = ? AND work_date = ? ORDER BY check_in_at', user.id, today);
     const action = open ? 'out' : 'in';
-    const workedToday = todays.reduce((a, x) => a + (x.check_out_at ? hoursBetween(x.check_in_at, x.check_out_at) : 0), 0);
+    const workedToday = todays.reduce((a, x) => a + (x.check_out_at ? paidHours(x.check_in_at, x.check_out_at) : 0), 0);
 
     return render(c, {
       title: 'Clock in/out',
@@ -67,8 +67,8 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
             <ul class="shift-list">
               ${todays.map((x) => html`
                 <li>
-                  <span>${localTime(x.check_in_at)} → ${x.check_out_at ? localTime(x.check_out_at) : '…'}</span>
-                  <span>${x.check_out_at ? html`${fmtHours(hoursBetween(x.check_in_at, x.check_out_at))} h ` : ''}${statusBadge(x)}</span>
+                  <span>${clockTime(x.check_in_at)} → ${x.check_out_at ? clockTime(x.check_out_at) : '…'}</span>
+                  <span>${x.check_out_at ? html`${fmtHours(paidHours(x.check_in_at, x.check_out_at))} h ` : ''}${statusBadge(x)}</span>
                 </li>`)}
             </ul>` : html`<p class="muted">No shifts yet today.</p>`}
           <p><a href="/me">See all my hours →</a></p>
@@ -183,8 +183,8 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, addFlags(open.flags, ...flags), workerNote, open.id],
         auditStmt(open.id, uid, 'clock_out'),
       ]);
-      const hrs = hoursBetween(open.check_in_at, now);
-      return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked out at ${localTime(now)} — ${fmtHours(hrs)} h. Waiting for supervisor approval.` });
+      const hrs = paidHours(open.check_in_at, now);
+      return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked out at ${localTime(now)} — ${formatHM(hrs)} counted (${localTime(roundTime(open.check_in_at))}–${localTime(roundTime(now))}). Waiting for supervisor approval.` });
     } catch (err) {
       if (/UNIQUE/.test(err.message)) return c.json({ error: "You're already clocked in." }, 409);
       throw err;
@@ -204,7 +204,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     let approved = 0; let pending = 0;
     for (const x of shifts) {
       if (!x.check_out_at) continue;
-      const h = hoursBetween(x.check_in_at, x.check_out_at);
+      const h = paidHours(x.check_in_at, x.check_out_at);
       if (x.status === 'approved') approved += h; else if (x.status === 'pending') pending += h;
     }
     const rate = user.hourly_rate;
@@ -234,9 +234,9 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
               <li>
                 <div class="row-between">
                   <strong>${prettyDate(x.work_date)}</strong>
-                  <span>${x.check_out_at ? html`<strong>${fmtHours(hoursBetween(x.check_in_at, x.check_out_at))} h</strong> ` : ''}${statusBadge(x)}</span>
+                  <span>${x.check_out_at ? html`<strong>${fmtHours(paidHours(x.check_in_at, x.check_out_at))} h</strong> ` : ''}${statusBadge(x)}</span>
                 </div>
-                <div>In ${localTime(x.check_in_at)} → Out ${x.check_out_at ? localTime(x.check_out_at) : '—'}${x.check_out_at && localDate(x.check_out_at) !== x.work_date ? html` <small class="muted">(next day)</small>` : ''}</div>
+                <div>In ${clockTime(x.check_in_at)} → Out ${x.check_out_at ? clockTime(x.check_out_at) : '—'}${x.check_out_at && localDate(x.check_out_at) !== x.work_date ? html` <small class="muted">(next day)</small>` : ''}</div>
                 ${x.reviewer_name ? html`<div class="muted small">${x.status === 'approved' ? 'Approved' : 'Rejected'} by ${x.reviewer_name} · ${prettyDate(localDate(x.reviewed_at))} ${localTime(x.reviewed_at)}</div>` : ''}
                 ${x.review_note ? html`<div class="small">“${x.review_note}”</div>` : ''}
                 ${flagList(x.flags, { forWorker: true })}

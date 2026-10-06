@@ -1,3 +1,5 @@
+import { localTime, roundTime } from './time.js';
+
 // Tiny HTML templating: every interpolated value is escaped unless it is
 // itself the result of html`` (or raw()).
 
@@ -63,6 +65,14 @@ export function statusBadge(shift) {
 }
 
 export const fmtHours = (h) => (Math.round(h * 100) / 100).toFixed(2);
+
+/** "13:13" plus the rounded time used for pay when it differs, e.g. "13:13 (13:15)". */
+export function clockTime(iso) {
+  if (!iso) return '';
+  const actual = localTime(iso);
+  const paid = localTime(roundTime(iso));
+  return paid === actual ? actual : html`${actual} <small class="muted" title="Rounded time used for pay">(${paid})</small>`;
+}
 export const fmtMoney = (n) => (n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 
 function nav(user, active) {

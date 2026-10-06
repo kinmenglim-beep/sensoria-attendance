@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { ensureSchema } from './db.js';
 import * as auth from './auth.js';
 import { html, layout } from './views.js';
-import { DEFAULT_TZ, setTimeZone } from './time.js';
+import { DEFAULT_TZ, setTimeZone, setRounding } from './time.js';
 import { envVar } from './env.js';
 import { registerWorkerRoutes } from './routes/worker.js';
 import { registerAdminRoutes } from './routes/admin.js';
@@ -47,6 +47,7 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
 
   app.use(async (c, next) => {
     setTimeZone(envVar(c, 'APP_TZ') || DEFAULT_TZ);
+    setRounding(envVar(c, 'ROUND_MINUTES') ?? undefined);
     const db = dbFor(c);
     if (!schemaReady) schemaReady = ensureSchema(db).catch((err) => { schemaReady = null; throw err; });
     await schemaReady;

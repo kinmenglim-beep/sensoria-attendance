@@ -79,6 +79,36 @@ export function daysInMonth(ym) {
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
 }
 
+// Clock times are rounded to the nearest quarter hour for pay (1:07 → 1:00,
+// 1:08 → 1:15). Configurable with the ROUND_MINUTES setting; 0 turns it off.
+export const DEFAULT_ROUND_MINUTES = 15;
+export let ROUND_MINUTES = DEFAULT_ROUND_MINUTES;
+
+export function setRounding(minutes) {
+  const m = Number(minutes);
+  ROUND_MINUTES = Number.isInteger(m) && m >= 0 && m <= 60 ? m : DEFAULT_ROUND_MINUTES;
+}
+
+/** Round a UTC ISO time to the nearest ROUND_MINUTES of local wall-clock time (seconds ignored). */
+export function roundTime(iso) {
+  if (!iso || !ROUND_MINUTES) return iso;
+  const ms = Math.floor(Date.parse(iso) / 60000) * 60000;
+  const offset = offsetMs(ms);
+  const step = ROUND_MINUTES * 60000;
+  const rounded = Math.floor((ms + offset + step / 2) / step) * step - offset;
+  return new Date(rounded).toISOString();
+}
+
+/** Payable hours for a shift: the time between the rounded check-in and check-out. */
+export function paidHours(startIso, endIso) {
+  return hoursBetween(roundTime(startIso), roundTime(endIso));
+}
+
+/** 2.25 → "2h 15m". */
+export function formatHM(hours) {
+  return formatDuration(Math.round(hours * 60) * 60000);
+}
+
 export function hoursBetween(startIso, endIso) {
   if (!startIso || !endIso) return 0;
   const ms = Date.parse(endIso) - Date.parse(startIso);

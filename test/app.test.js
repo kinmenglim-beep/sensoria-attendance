@@ -90,7 +90,7 @@ test('end-to-end: setup, clock in/out, approve, export', async () => {
   assert.equal(r.status, 400);
   const yesterday = new Date(Date.now() - 86400000);
   const yDate = localDate(yesterday);
-  r = await sup('POST', `/admin/shifts/${shift.id}/edit`, { form: { work_date: yDate, in_time: '09:00', out_time: '17:00', reason: 'fixed' } });
+  r = await sup('POST', `/admin/shifts/${shift.id}/edit`, { form: { work_date: yDate, in_time: '08:53', out_time: '17:07', reason: 'fixed' } });
   assert.equal(r.status, 302);
   r = await sup('POST', '/admin/shifts/approve', { form: { ids: String(shift.id), back: '/admin/pending' } });
   assert.match(r.location, /Approved%201%20shift/);
@@ -121,6 +121,8 @@ test('end-to-end: setup, clock in/out, approve, export', async () => {
 
   r = await sup('GET', `/admin/export/detail.csv?month=${ym}`);
   assert.match(r.text, /Approved,Sam Supervisor/);
+  // Actual and rounded times, rounded hours and actual hours.
+  assert.match(r.text, /08:53,\d{4}-\d{2}-\d{2} 17:07,\d{4}-\d{2}-\d{2} 09:00,\d{4}-\d{2}-\d{2} 17:00,8,8\.23,Approved/);
   assert.match(r.text, /Added by supervisor/);
   assert.match(r.text, /Checked out outside area; Times edited/);
 

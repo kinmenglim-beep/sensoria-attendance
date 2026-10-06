@@ -1,4 +1,4 @@
-import { daysInMonth, hoursBetween } from './time.js';
+import { daysInMonth, paidHours } from './time.js';
 import { DEVICE_COLUMNS, DEVICE_JOINS } from './device.js';
 
 export const round2 = (n) => Math.round(n * 100) / 100;
@@ -42,7 +42,7 @@ export async function monthReport(db, ym) {
     row.shifts += 1;
     if (s.flags) row.flagged += 1;
     if (!s.check_out_at) { row.open += 1; continue; }
-    const hrs = hoursBetween(s.check_in_at, s.check_out_at);
+    const hrs = paidHours(s.check_in_at, s.check_out_at);
     if (s.status === 'approved') {
       row.approved += hrs;
       row.daily[Number(s.work_date.slice(8, 10)) - 1] += hrs;

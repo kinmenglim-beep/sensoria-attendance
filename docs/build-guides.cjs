@@ -74,17 +74,17 @@ const ADMIN = {
   subtitle: 'For supervisors and managers',
   blocks: [
     { t: 'h', text: 'Links' },
-    { t: 'table', widths: [0.42, 0.43, 0.15], rows: [
-      [['What'], ['Link'], ['Who']],
-      [['First-time setup: creates the first admin. Works **once only**.'], [L('/setup')], ['Owner']],
-      [['Sign in (same page for everyone)'], [L('/login')], ['Everyone']],
-      [['Worker: clock in / out'], [L('/')], ['Workers']],
-      [['Worker: my hours'], [L('/me')], ['Workers']],
-      [['Admin dashboard (today)'], [L('/admin')], ['Admins']],
-      [['Approvals (all pending)'], [L('/admin/pending')], ['Admins']],
-      [['People: add accounts, reset PINs'], [L('/admin/people')], ['Admins']],
-      [['Monthly export (CSV)'], [L('/admin/export')], ['Admins']],
-      [['Settings and work sites'], [L('/admin/settings')], ['Admins']],
+    { t: 'table', widths: [0.36, 0.64], rows: [
+      [['What'], ['Link']],
+      [['**First-time setup:** creates the first admin (owner, **once only**)'], [L('/setup')]],
+      [['**Sign in:** same page for everyone'], [L('/login')]],
+      [['**Worker:** clock in / out'], [L('/')]],
+      [['**Worker:** my hours'], [L('/me')]],
+      [['**Admin:** dashboard (today)'], [L('/admin')]],
+      [['**Admin:** approvals (all pending)'], [L('/admin/pending')]],
+      [['**Admin:** people, add accounts, reset PINs'], [L('/admin/people')]],
+      [['**Admin:** monthly export (CSV)'], [L('/admin/export')]],
+      [['**Admin:** settings and work sites'], [L('/admin/settings')]],
     ] },
     { t: 'p', parts: ['**Accounts:** workers cannot sign up themselves. An admin creates every account, for workers and other admins, under **People**.'] },
     { t: 'h', text: 'One-time setup' },
@@ -151,12 +151,13 @@ const MARGIN = 1134; // 2 cm
 const CONTENT_W = PAGE_W - 2 * MARGIN;
 const cellBorder = { style: BorderStyle.SINGLE, size: 4, color: 'D5DCE2' };
 
-function docxInline(parts, base = {}) {
+function docxInline(parts, { linkSize, ...base } = {}) {
   return parts.flatMap((part) => {
     if (typeof part === 'object') {
       const text = linkText(part.link);
-      if (!LINK) return [new TextRun({ text, bold: true, highlight: 'yellow', ...base })];
-      return [new ExternalHyperlink({ link: LINK + part.link, children: [new TextRun({ text, style: 'Hyperlink', ...base })] })];
+      const size = linkSize ? { size: linkSize } : {};
+      if (!LINK) return [new TextRun({ text, bold: true, highlight: 'yellow', ...size })];
+      return [new ExternalHyperlink({ link: LINK + part.link, children: [new TextRun({ text, style: 'Hyperlink', ...size })] })];
     }
     return segments(part).map((s) => new TextRun({ text: s.text, bold: s.bold || base.bold, ...base, ...(s.bold ? { bold: true } : {}) }));
   });
@@ -202,7 +203,7 @@ function buildDocx(guide) {
             borders: { top: cellBorder, bottom: cellBorder, left: cellBorder, right: cellBorder },
             shading: r === 0 ? { fill: 'E6F2F1', type: ShadingType.CLEAR, color: 'auto' } : undefined,
             margins: { top: 70, bottom: 70, left: 110, right: 110 },
-            children: [new Paragraph({ children: docxInline(cell, r === 0 ? { bold: true } : {}) })],
+            children: [new Paragraph({ children: docxInline(cell, r === 0 ? { bold: true } : { linkSize: 18 }) })],
           })),
         })),
       }));
@@ -253,7 +254,8 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 function htmlInline(parts) {
   return parts.map((part) => {
     if (typeof part === 'object') {
-      const text = esc(linkText(part.link));
+      // Allow a line break only between the address and the path.
+      const text = esc(linkText(part.link)).replace(/(\.dev|LINK)\//, '$1<wbr>/');
       return LINK ? `<a href="${esc(LINK + part.link)}">${text}</a>` : `<mark>${text}</mark>`;
     }
     return segments(part).map((s) => (s.bold ? `<b>${esc(s.text)}</b>` : esc(s.text))).join('');
@@ -285,7 +287,8 @@ function buildHtml(guide) {
     ol, ul { margin: 4pt 0; padding-left: 18pt; }
     li { margin: 3pt 0; }
     table { width: 100%; border-collapse: collapse; table-layout: fixed; margin: 4pt 0; }
-    th, td { border: 0.6pt solid #d5dce2; padding: 4pt 6pt; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+    th, td { border: 0.6pt solid #d5dce2; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+    td a, td mark { font-size: 9pt; white-space: nowrap; }
     th { background: #e6f2f1; }
     tr { break-inside: avoid; }
     .box { background: #f1f7f6; border: 0.6pt solid #${TEAL}; border-left: 3pt solid #${TEAL}; padding: 6pt 10pt; break-inside: avoid; }

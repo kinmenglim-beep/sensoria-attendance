@@ -3,25 +3,24 @@
 > Printable versions for end users: **docs/Worker-Guide.pdf** and **docs/Admin-Guide.pdf** (editable: the `.docx` files).
 > Rebuild them with the real link: `APP_LINK=https://… npm run guides`.
 
-> **Before sharing:** replace `YOUR-LINK` throughout with the app's address from Cloudflare,
-> e.g. `https://sensoria-attendance.yourname.workers.dev`.
+> App address: **https://sensoria-attendance.kinmenglim.workers.dev**
 
 ## Links
 
 | What | Link | Who |
 |---|---|---|
-| First-time setup (creates the **first admin**) | `YOUR-LINK/setup` | Owner, **once only**. It stops working after the first admin exists. |
-| Sign in (everyone) | `YOUR-LINK/login` | Admins and workers use the same page; each is taken to their own screen. |
-| Worker: clock in / out | `YOUR-LINK/` | Workers |
-| Worker: my hours | `YOUR-LINK/me` | Workers |
-| Admin dashboard (today) | `YOUR-LINK/admin` | Admins |
-| Approvals (all pending) | `YOUR-LINK/admin/pending` | Admins |
-| Add / edit people, reset PINs | `YOUR-LINK/admin/people` | Admins |
-| Monthly export (CSV) | `YOUR-LINK/admin/export` | Admins |
-| Settings and work sites | `YOUR-LINK/admin/settings` | Admins |
+| First-time setup (creates the **first admin**) | `https://sensoria-attendance.kinmenglim.workers.dev/setup` | Owner, **once only**. It stops working after the first admin exists. |
+| Sign in (everyone) | `https://sensoria-attendance.kinmenglim.workers.dev/login` | Admins and workers use the same page; each is taken to their own screen. |
+| Worker: clock in / out | `https://sensoria-attendance.kinmenglim.workers.dev/` | Workers |
+| Worker: my hours | `https://sensoria-attendance.kinmenglim.workers.dev/me` | Workers |
+| Admin dashboard (today) | `https://sensoria-attendance.kinmenglim.workers.dev/admin` | Admins |
+| Approvals (all pending) | `https://sensoria-attendance.kinmenglim.workers.dev/admin/pending` | Admins |
+| Add / edit people, reset PINs | `https://sensoria-attendance.kinmenglim.workers.dev/admin/people` | Admins |
+| Monthly export (CSV) | `https://sensoria-attendance.kinmenglim.workers.dev/admin/export` | Admins |
+| Settings and work sites | `https://sensoria-attendance.kinmenglim.workers.dev/admin/settings` | Admins |
 
 **Creating accounts:** workers **cannot sign up themselves**. An admin creates every account (workers and other
-admins) at **People** (`YOUR-LINK/admin/people`).
+admins) at **People** (`https://sensoria-attendance.kinmenglim.workers.dev/admin/people`).
 
 ---
 
@@ -55,7 +54,7 @@ admins) at **People** (`YOUR-LINK/admin/people`).
 ## Admin guide
 
 **One-time setup**
-1. Open `YOUR-LINK/setup` and create your admin account (username + password of 8 or more characters).
+1. Open `https://sensoria-attendance.kinmenglim.workers.dev/setup` and create your admin account (username + password of 8 or more characters).
 2. **Settings → Work sites:** stand at the venue and tap **Use my current location** → **Add site**.
    A radius of 150 m is a good default.
 3. **People:** add each worker with their name, **phone number** (their sign-in ID), a **PIN** (4 or more digits)
@@ -88,6 +87,6 @@ admins) at **People** (`YOUR-LINK/admin/people`).
 - **Someone leaves:** People → name → untick **Active** → Save. Their history is kept.
 
 **Message template for workers**
-> Hi [name], here's our attendance app: YOUR-LINK
+> Hi [name], here's our attendance app: https://sensoria-attendance.kinmenglim.workers.dev
 > Sign in with your phone number [number] and PIN [PIN].
 > Please use your own phone, allow location, and tap Clock IN / Clock OUT at the venue each shift.

@@ -1,5 +1,8 @@
 # Attendance: user manual
 
+> Printable versions for end users: **docs/Worker-Guide.pdf** and **docs/Admin-Guide.pdf** (editable: the `.docx` files).
+> Rebuild them with the real link: `APP_LINK=https://… npm run guides`.
+
 > **Before sharing:** replace `YOUR-LINK` throughout with the app's address from Cloudflare,
 > e.g. `https://sensoria-attendance.yourname.workers.dev`.
 

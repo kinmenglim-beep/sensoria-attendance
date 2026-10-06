@@ -9,7 +9,8 @@
     "deploy": "wrangler deploy",
     "start": "node --disable-warning=ExperimentalWarning src/node.js",
     "start:dev": "node --disable-warning=ExperimentalWarning --watch src/node.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "guides": "node docs/build-guides.cjs"
   },
   "engines": {
     "node": ">=22.13"
@@ -20,6 +21,7 @@
     "hono": "^4.13.13"
   },
   "devDependencies": {
+    "docx": "^9.8.1",
     "wrangler": "^4.147.0"
   }
 }

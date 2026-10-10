@@ -74,7 +74,7 @@ export async function sessionUser(c, db) {
   const token = getCookie(c, COOKIE);
   if (!token) return null;
   return db.get(`
-    SELECT u.id, u.name, u.login, u.role, u.hourly_rate
+    SELECT u.id, u.name, u.login, u.short_name, u.role, u.hourly_rate
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1
   `, await sha256(token), Date.now());

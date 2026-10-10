@@ -3,10 +3,12 @@
 // for Node's built-in SQLite (src/db-node.js), so the same SQL runs on both.
 
 const SCHEMA = [
+  // short_name: optional short sign-in name such as initials ("KML").
   `CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
     login       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    short_name  TEXT COLLATE NOCASE,
     secret_hash TEXT NOT NULL,
     role        TEXT NOT NULL CHECK (role IN ('worker', 'supervisor')),
     hourly_rate REAL,
@@ -57,7 +59,8 @@ const SCHEMA = [
     PRIMARY KEY (user_id, device_id)
   )`,
   // One row per check-in/check-out pair. Times are stored as UTC ISO strings;
-  // work_date is the local (APP_TZ) date of the check-in.
+  // work_date is the local (APP_TZ) date of the check-in. sched_start/sched_end:
+  // the rostered shift the check-in was matched to, if any.
   `CREATE TABLE IF NOT EXISTS shifts (
     id            INTEGER PRIMARY KEY,
     user_id       INTEGER NOT NULL REFERENCES users(id),
@@ -68,6 +71,8 @@ const SCHEMA = [
     in_device_id  INTEGER REFERENCES devices(id),
     out_lat REAL, out_lng REAL, out_accuracy REAL, out_site TEXT, out_distance_m REAL, out_ip TEXT,
     out_device_id INTEGER REFERENCES devices(id),
+    sched_start   TEXT,
+    sched_end     TEXT,
     flags         TEXT NOT NULL DEFAULT '',
     worker_note   TEXT,
     status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
@@ -89,7 +94,40 @@ const SCHEMA = [
     at       TEXT NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS audit_by_shift ON audit(shift_id)',
+  // Rostered working hours: one row per shift (a split shift is two rows).
+  // Times are local HH:MM; an end before the start means the shift ends the next day.
+  `CREATE TABLE IF NOT EXISTS roster (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    work_date  TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time   TEXT NOT NULL
+  )`,
+  'CREATE INDEX IF NOT EXISTS roster_by_date ON roster(work_date, user_id)',
+  // Clock-in selfies, stored as base64 JPEG (~30 KB each) and pruned after PHOTO_KEEP_DAYS.
+  `CREATE TABLE IF NOT EXISTS photos (
+    id       INTEGER PRIMARY KEY,
+    shift_id INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    data     TEXT NOT NULL,
+    taken_at TEXT NOT NULL
+  )`,
+  'CREATE INDEX IF NOT EXISTS photos_by_shift ON photos(shift_id)',
 ];
+
+// Columns added after the first release; older databases get them via ALTER TABLE.
+const ADDED_COLUMNS = [
+  ['users', 'short_name', 'TEXT COLLATE NOCASE'],
+  ['shifts', 'sched_start', 'TEXT'],
+  ['shifts', 'sched_end', 'TEXT'],
+];
+// Statements that depend on the added columns.
+const AFTER_MIGRATION = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS users_short_name ON users(short_name) WHERE short_name IS NOT NULL',
+];
+
+// Clock-in selfies older than this are deleted.
+export const PHOTO_KEEP_DAYS = 90;
 
 export const DEFAULT_SETTINGS = {
   // off | flag | block — what to do when GPS is missing or outside every site.
@@ -101,6 +139,14 @@ export const DEFAULT_SETTINGS = {
   device_mode: 'flag',
   // Alert when a worker uses this many different phones within 30 days.
   device_alert_count: '3',
+  // off | flag | block — compare clock-ins with the roster (late, too early, not rostered).
+  schedule_mode: 'off',
+  // Minutes after the rostered start before a clock-in counts as late.
+  late_grace_min: '5',
+  // How many minutes before the rostered start a worker may clock in.
+  early_clockin_min: '30',
+  // off | flag | block — selfie at clock-in: off, ask (flag if skipped), or required.
+  selfie_mode: 'off',
 };
 
 /** Create tables and default settings if they don't exist yet (cheap, idempotent). */
@@ -109,6 +155,12 @@ export async function ensureSchema(db) {
     ...SCHEMA.map((sql) => [sql]),
     ...Object.entries(DEFAULT_SETTINGS).map(([k, v]) => ['INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', k, v]),
   ]);
+  const existing = new Map();
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    if (!existing.has(table)) existing.set(table, new Set((await db.all(`PRAGMA table_info(${table})`)).map((r) => r.name)));
+    if (!existing.get(table).has(column)) await db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+  await db.batch(AFTER_MIGRATION.map((sql) => [sql]));
 }
 
 export async function getSettings(db) {

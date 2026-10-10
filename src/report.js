@@ -1,5 +1,6 @@
 import { daysInMonth, paidHours } from './time.js';
 import { DEVICE_COLUMNS, DEVICE_JOINS } from './device.js';
+import { minutesLate } from './schedule.js';
 
 export const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -32,7 +33,7 @@ export async function monthReport(db, ym) {
   for (const w of workers) {
     byId.set(w.id, {
       worker: w, daily: new Array(nDays).fill(0), dates: new Set(),
-      shifts: 0, approved: 0, pending: 0, rejected: 0, open: 0, flagged: 0,
+      shifts: 0, approved: 0, pending: 0, rejected: 0, open: 0, flagged: 0, late: 0, lateMin: 0,
     });
   }
 
@@ -41,6 +42,10 @@ export async function monthReport(db, ym) {
     if (!row) continue;
     row.shifts += 1;
     if (s.flags) row.flagged += 1;
+    if (String(s.flags).split(',').includes('in:late')) {
+      row.late += 1;
+      row.lateMin += minutesLate(s);
+    }
     if (!s.check_out_at) { row.open += 1; continue; }
     const hrs = paidHours(s.check_in_at, s.check_out_at);
     if (s.status === 'approved') {
@@ -71,6 +76,8 @@ export async function monthReport(db, ym) {
     pending: round2(rows.reduce((a, r) => a + r.pending, 0)),
     rejected: round2(rows.reduce((a, r) => a + r.rejected, 0)),
     open: rows.reduce((a, r) => a + r.open, 0),
+    late: rows.reduce((a, r) => a + r.late, 0),
+    lateMin: rows.reduce((a, r) => a + r.lateMin, 0),
     pay: round2(rows.reduce((a, r) => a + (r.pay || 0), 0)),
     daily: Array.from({ length: nDays }, (_, i) => round2(rows.reduce((a, r) => a + r.daily[i], 0))),
   };

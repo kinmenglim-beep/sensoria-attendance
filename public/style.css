@@ -144,6 +144,20 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--primary); o
 .clock-status { font-size: 1.6rem; }
 .clock-card.is-in .clock-status { color: var(--green); }
 .clock-since { font-size: 1.1rem; margin: 0; min-height: 1.5em; }
+.roster-today { margin: 0; }
+.selfie-picker { cursor: pointer; align-items: center; display: flex; flex-direction: column; }
+.selfie-preview {
+  width: 160px; height: 160px; border-radius: 50%; overflow: hidden;
+  border: 3px dashed var(--border); display: flex; align-items: center; justify-content: center;
+  background: var(--bg); text-align: center; color: var(--muted); font-weight: 600;
+}
+.selfie-preview.has-photo { border-style: solid; border-color: var(--primary); }
+.selfie-preview img { width: 100%; height: 100%; object-fit: cover; }
+.selfie-placeholder { font-size: .95rem; line-height: 1.5; }
+.selfie { width: 100%; max-width: 240px; border-radius: 10px; border: 1px solid var(--border); display: block; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.roster-table input { min-width: 170px; font-size: .9rem; padding: 6px 8px; }
+.roster-table td.today, .roster-table th.today { background: var(--badge-open-bg); }
 .shift-list { list-style: none; margin: 0; padding: 0; }
 .shift-list li { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .shift-list li:last-child { border-bottom: 0; }

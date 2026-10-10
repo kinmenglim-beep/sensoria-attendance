@@ -1,0 +1,20 @@
+{
+  // Second deployment of the same app for the restaurant: its own Worker, link and database.
+  // Deploy with: npx wrangler deploy --config wrangler.restaurant.jsonc
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "restaurant-attendance",
+  "main": "src/cloudflare.js",
+  "compatibility_date": "2025-09-01",
+  "assets": { "directory": "./public" },
+  // A separate database, so the restaurant's staff and hours never mix with the other venue's.
+  "d1_databases": [
+    { "binding": "DB", "database_name": "restaurant-attendance" }
+  ],
+  "vars": {
+    // Name shown in the menu bar and browser tab.
+    "APP_NAME": "Restaurant Attendance",
+    "APP_TZ": "Asia/Kuala_Lumpur",
+    "ROUND_MINUTES": "15"
+  },
+  "observability": { "enabled": true }
+}

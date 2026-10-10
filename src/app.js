@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
 
-import { ensureSchema } from './db.js';
+import { ensureSchema, getSettings } from './db.js';
 import * as auth from './auth.js';
-import { html, layout } from './views.js';
+import { html, layout, setAppName } from './views.js';
 import { DEFAULT_TZ, setTimeZone, setRounding } from './time.js';
 import { envVar } from './env.js';
 import { registerWorkerRoutes } from './routes/worker.js';
@@ -25,9 +25,9 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('X-Frame-Options', 'DENY');
     c.header('Referrer-Policy', 'same-origin');
-    c.header('Permissions-Policy', 'geolocation=(self), camera=()');
+    c.header('Permissions-Policy', 'geolocation=(self), camera=(self)');
     c.header('Content-Security-Policy',
-      "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; form-action 'self'");
+      "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; form-action 'self'");
   });
 
   app.get('/healthz', (c) => c.text('ok'));
@@ -48,6 +48,7 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
   app.use(async (c, next) => {
     setTimeZone(envVar(c, 'APP_TZ') || DEFAULT_TZ);
     setRounding(envVar(c, 'ROUND_MINUTES') ?? undefined);
+    setAppName(envVar(c, 'APP_NAME'));
     const db = dbFor(c);
     if (!schemaReady) schemaReady = ensureSchema(db).catch((err) => { schemaReady = null; throw err; });
     await schemaReady;
@@ -58,10 +59,12 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
     return next();
   });
 
-  function render(c, opts, status = 200) {
+  async function render(c, opts, status = 200) {
     const user = c.get('user');
     const flash = opts.flash !== undefined ? opts.flash : (c.req.query('ok') ?? null);
-    return c.html(layout({ user, ...opts, flash }), status);
+    // The Roster menu item only appears once roster checks are switched on in Settings.
+    const roster = user?.role === 'supervisor' && (await getSettings(c.get('db'))).schedule_mode !== 'off';
+    return c.html(layout({ user, ...opts, flash, roster }), status);
   }
 
   /** Parsed form body; repeated fields (e.g. ids) come back as arrays. */
@@ -81,9 +84,9 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
       body: html`
         <div class="auth-box card">
           <h1>Sign in</h1>
-          <p class="muted">Workers: use your phone number / staff ID and PIN.</p>
+          <p class="muted">Workers: use your phone number or short name, and your PIN.</p>
           <form method="post" action="/login" class="stack">
-            <label>Phone / Staff ID / Username
+            <label>Phone number / Short name / Username
               <input name="login" value="${login}" autocomplete="username" autocapitalize="none" required autofocus>
             </label>
             <label>PIN or password
@@ -112,7 +115,10 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
     if (locked) {
       return loginPage(c, { login, error: `Too many attempts. Try again in ${Math.ceil(locked / 60000)} minutes.` }, 429);
     }
-    const user = await db.get('SELECT * FROM users WHERE login = ? AND active = 1', login);
+    // Sign in with the phone number / staff ID or the short name; an exact login match wins.
+    const user = await db.get(
+      'SELECT * FROM users WHERE (login = ?1 OR short_name = ?1) AND active = 1 ORDER BY login = ?1 DESC LIMIT 1', login,
+    );
     if (!user || !(await auth.verifySecret(secret, user.secret_hash))) {
       await auth.recordLoginFailure(db, ip, login);
       return loginPage(c, { login, error: 'Incorrect login or PIN/password.' }, 401);

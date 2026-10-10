@@ -42,6 +42,11 @@ export const FLAG_LABELS = {
   'in:shared_device': 'Device also used by another worker',
   'out:shared_device': 'Check-out device also used by another worker',
   'out:device_changed': 'Clocked out on a different device',
+  'in:late': 'Late',
+  'in:too_early': 'Clocked in well before rostered start',
+  'in:unscheduled': 'Not on the roster',
+  'out:left_early': 'Left before rostered end',
+  'in:no_selfie': 'No selfie',
   no_checkout: 'Never clocked out',
   manual: 'Added by supervisor',
   edited: 'Times edited',
@@ -50,10 +55,13 @@ export const FLAG_LABELS = {
 // Device flags are only shown to supervisors.
 const SUPERVISOR_ONLY = (f) => f.includes('device');
 
-export function flagList(flags, { forWorker = false } = {}) {
+/** Readable flag; pass lateMin to show "Late 12 min". */
+export const flagLabel = (f, { lateMin = 0 } = {}) => (f === 'in:late' && lateMin ? `Late ${lateMin} min` : FLAG_LABELS[f] || f);
+
+export function flagList(flags, { forWorker = false, lateMin = 0 } = {}) {
   const list = String(flags || '').split(',').filter((f) => f && !(forWorker && SUPERVISOR_ONLY(f)));
   if (!list.length) return '';
-  const content = html`${list.map((f) => html`<span class="flag">${FLAG_LABELS[f] || f}</span>`)}`;
+  const content = html`${list.map((f) => html`<span class="flag">${flagLabel(f, { lateMin })}</span>`)}`;
   return forWorker ? html`<div>${content}</div>` : content;
 }
 
@@ -75,13 +83,21 @@ export function clockTime(iso) {
 }
 export const fmtMoney = (n) => (n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 
-function nav(user, active) {
+// Shown in the menu bar and page titles; set per deployment with APP_NAME.
+export const DEFAULT_APP_NAME = 'Attendance';
+export let APP_NAME = DEFAULT_APP_NAME;
+export function setAppName(name) {
+  APP_NAME = String(name || '').trim().slice(0, 40) || DEFAULT_APP_NAME;
+}
+
+function nav(user, active, { roster = false } = {}) {
   if (!user) return '';
   const link = (href, label, key) => html`<a href="${href}" class="${active === key ? 'active' : ''}">${label}</a>`;
   const links = user.role === 'supervisor'
     ? [
       link('/admin', 'Dashboard', 'dashboard'),
       link('/admin/pending', 'Approvals', 'pending'),
+      ...(roster ? [link('/admin/roster', 'Roster', 'roster')] : []),
       link('/admin/export', 'Export', 'export'),
       link('/admin/people', 'People', 'people'),
       link('/admin/settings', 'Settings', 'settings'),
@@ -90,7 +106,7 @@ function nav(user, active) {
   return html`
     <nav class="nav">
       <div class="nav-inner">
-        <a class="brand" href="${user.role === 'supervisor' ? '/admin' : '/'}">Attendance</a>
+        <a class="brand" href="${user.role === 'supervisor' ? '/admin' : '/'}">${APP_NAME}</a>
         <div class="nav-links">${links}</div>
         <form method="post" action="/logout" class="nav-logout">
           <span class="nav-user">${user.name}</span>
@@ -100,20 +116,20 @@ function nav(user, active) {
     </nav>`;
 }
 
-export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [] }) {
+export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [], roster = false }) {
   return html`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f766e">
-  <title>${title} · Attendance</title>
+  <title>${title} · ${APP_NAME}</title>
   <link rel="stylesheet" href="/style.css">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
 </head>
 <body>
-  ${nav(user, active)}
+  ${nav(user, active, { roster })}
   <main class="container">
     ${flash ? html`<div class="alert alert-ok" role="status">${flash}</div>` : ''}
     ${error ? html`<div class="alert alert-error" role="alert">${error}</div>` : ''}

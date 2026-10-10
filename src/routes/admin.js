@@ -1,5 +1,5 @@
 import {
-  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag,
+  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag, PHOTO_KEEP_DAYS,
 } from '../db.js';
 import { hashSecret } from '../auth.js';
 import {
@@ -7,12 +7,15 @@ import {
   prettyDate, prettyMonth, isDate, isMonth, isTime, TZ,
 } from '../time.js';
 import { normalizeIp } from '../verify.js';
-import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime, FLAG_LABELS } from '../views.js';
+import { html, statusBadge, flagList, flagLabel, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { monthReport } from '../report.js';
 import { toCsv } from '../csv.js';
 import {
   deviceName, frequentDeviceChangers, recentDeviceCount, DEVICE_COLUMNS, DEVICE_JOINS,
 } from '../device.js';
+import {
+  parseRanges, formatRanges, slotTimes, weekStart, minutesLate,
+} from '../schedule.js';
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -69,7 +72,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
                   <td>${clockTime(s.check_in_at)}</td>
                   <td>${s.check_out_at ? clockTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
-                  <td>${flagList(s.flags) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
+                  <td>${flagList(s.flags, { lateMin: minutesLate(s) }) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
                   <td>${statusBadge(s)}${s.reviewer_name ? html`<div class="muted small">${s.reviewer_name}</div>` : ''}</td>
                   <td><a href="/admin/shifts/${s.id}">View</a></td>
                 </tr>`)}
@@ -102,11 +105,20 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
       byUser.get(s.user_id).push(s);
     }
-    const working = []; const done = []; const absent = [];
+    const settings = await getSettings(db);
+    // With a roster for the day, "not clocked in" only lists people rostered to work; the rest are off.
+    const rosterRows = settings.schedule_mode === 'off' ? [] : await db.all('SELECT * FROM roster WHERE work_date = ? ORDER BY start_time', date);
+    const rostered = new Map();
+    for (const r of rosterRows) {
+      if (!rostered.has(r.user_id)) rostered.set(r.user_id, []);
+      rostered.get(r.user_id).push(r);
+    }
+    const working = []; const done = []; const absent = []; const off = [];
     for (const w of workers) {
       const list = byUser.get(w.id) || [];
       const open = list.find((s) => !s.check_out_at);
-      if (!list.length) absent.push(w);
+      if (!list.length && rosterRows.length && !rostered.has(w.id)) off.push(w);
+      else if (!list.length) absent.push({ ...w, roster: rostered.get(w.id) || [] });
       else if (open) working.push({ w, open });
       else done.push({ w, hours: list.reduce((a, s) => a + shiftHours(s), 0), last: list[list.length - 1].check_out_at });
     }
@@ -117,7 +129,18 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     `, today);
     const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
     const back = `/admin?date=${date}`;
-    const settings = await getSettings(db);
+    const graceMs = (Number(settings.late_grace_min) || 0) * 60000;
+    /** "rostered 10:00-14:00", "late 12m" once the current rostered shift has started, or "missed". */
+    const dueLabel = (w) => {
+      if (!w.roster.length) return '';
+      const times = formatRanges(w.roster);
+      const slots = w.roster.map((r) => slotTimes(date, r.start_time, r.end_time));
+      const current = slots.find((x) => Date.now() <= Date.parse(x.endIso));
+      if (!current) return html`<span class="flag">missed</span> <span class="muted small">${times}</span>`;
+      const lateMs = Date.now() - Date.parse(current.startIso);
+      if (lateMs > graceMs) return html`<span class="flag">late ${formatDuration(lateMs)}</span> <span class="muted small">${times}</span>`;
+      return html`<span class="muted small">rostered ${times}</span>`;
+    };
     const alertCount = Number(settings.device_alert_count) || 0;
     const deviceChangers = alertCount >= 2 ? await frequentDeviceChangers(db, alertCount) : [];
     const phonesToReview = settings.device_mode === 'off' ? [] : await db.all(`
@@ -177,8 +200,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <div class="card">
             <h2>Not clocked in <span class="count">${absent.length}</span></h2>
             ${absent.length ? html`<ul class="people-list">
-              ${absent.map((w) => html`<li><span>${w.name}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
+              ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
             </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
+            ${off.length ? html`<p class="muted small">Off (not rostered): ${off.map((w) => w.name).join(', ')}</p>` : ''}
           </div>
           <div class="card">
             <h2>Working now <span class="count">${working.length}</span></h2>
@@ -389,6 +413,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const inDevice = await deviceDetail(db, shift.in_device_id, shift.in_device_label, shift.in_device_key, shift.user_id);
     const outDevice = await deviceDetail(db, shift.out_device_id, shift.out_device_label, shift.out_device_key, shift.user_id);
     const hrs = shiftHours(shift);
+    const photo = await db.get('SELECT id, taken_at FROM photos WHERE shift_id = ? ORDER BY taken_at DESC LIMIT 1', shift.id);
     const v = values || {
       work_date: shift.work_date,
       in_time: localTime(shift.check_in_at),
@@ -416,7 +441,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               ${shift.review_note ? html`<div class="small">“${shift.review_note}”</div>` : ''}
             </div>
           </div>
-          ${shift.flags ? html`<p>${flagList(shift.flags)}</p>` : ''}
+          ${shift.sched_start ? html`<p><span class="label">Rostered</span> ${localTime(shift.sched_start)}–${localTime(shift.sched_end)}${minutesLate(shift) ? html` · clocked in ${minutesLate(shift)} min after the start` : ''}</p>` : ''}
+          ${shift.flags ? html`<p>${flagList(shift.flags, { lateMin: minutesLate(shift) })}</p>` : ''}
           ${shift.worker_note ? html`<p><span class="label">Worker note</span> ${shift.worker_note}</p>` : ''}
 
           ${hasFlag(shift.flags, 'no_checkout') ? html`<p class="alert alert-warn">This worker never clocked out. Enter the real check-out time below before approving.</p>` : ''}
@@ -443,6 +469,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <section class="grid-2">
           <div class="card">
             <h2>Check-in verification</h2>
+            ${photo ? html`<p><img class="selfie" src="/admin/photos/${photo.id}" alt="Selfie taken at check-in" loading="lazy"></p>` : ''}
             <p>${locationSummary(shift.in_site, shift.in_distance_m, shift.in_accuracy, shift.in_lat, shift.in_lng)}</p>
             ${inDevice}
             ${shift.in_ip ? html`<p class="muted small">IP ${shift.in_ip}</p>` : ''}
@@ -519,6 +546,10 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <label>Phone / Staff ID (used to sign in)
           <input name="login" value="${values.login || ''}" required maxlength="50" autocapitalize="none">
         </label>
+        <label>Short name (optional, also used to sign in)
+          <input name="short_name" value="${values.short_name || ''}" maxlength="12" autocapitalize="characters" placeholder="e.g. KML">
+          <span class="hint">Initials or a nickname: 2–12 letters or digits, easier to type than a phone number.</span>
+        </label>
         <label>Role
           <select name="role" data-role-select>
             <option value="worker" ${values.role !== 'supervisor' ? 'selected' : ''}>Worker</option>
@@ -539,17 +570,30 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const v = {
       name: String(b.name || '').trim(),
       login: String(b.login || '').trim(),
+      short_name: String(b.short_name || '').trim() || null,
       role: b.role === 'supervisor' ? 'supervisor' : 'worker',
       hourly_rate: b.hourly_rate === '' || b.hourly_rate === undefined ? null : Number(b.hourly_rate),
       secret: String(b.secret || ''),
     };
     if (!v.name || !v.login) return { v, error: 'Name and phone/staff ID are required.' };
     if (v.hourly_rate !== null && !(v.hourly_rate >= 0)) return { v, error: 'Hourly rate must be a positive number.' };
+    if (v.short_name && !/^[A-Za-z0-9]{2,12}$/.test(v.short_name)) return { v, error: 'Short name: 2–12 letters or digits, no spaces.' };
     if (isNew || v.secret) {
       if (v.role === 'supervisor' && v.secret.length < 8) return { v, error: 'Supervisor passwords need at least 8 characters.' };
       if (v.role === 'worker' && v.secret.length < 4) return { v, error: 'Worker PINs need at least 4 characters.' };
     }
     return { v };
+  }
+
+  /** A login name or short name must not match anyone else's, or sign-in would be ambiguous. */
+  async function signInClash(db, v, selfId = 0) {
+    const names = [v.login, v.short_name].filter(Boolean);
+    const marks = names.map(() => '?').join(',');
+    const other = await db.get(
+      `SELECT name FROM users WHERE id <> ? AND (login IN (${marks}) OR short_name IN (${marks})) LIMIT 1`,
+      selfId, ...names, ...names,
+    );
+    return other ? `That phone/staff ID or short name is already used by ${other.name}.` : null;
   }
 
   async function peoplePage(c, { error = null, values = {} } = {}, status = 200) {
@@ -586,7 +630,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <tbody>
                 ${people.map((p) => html`
                   <tr class="${p.active ? '' : 'inactive'}">
-                    <td>${p.name}</td><td>${p.login}</td>
+                    <td>${p.name}</td><td>${p.login}${p.short_name ? html` <span class="muted">· ${p.short_name}</span>` : ''}</td>
                     <td>${p.role === 'supervisor' ? 'Supervisor' : 'Worker'}</td>
                     <td class="num">${p.hourly_rate != null ? fmtMoney(p.hourly_rate) : '—'}</td>
                     <td>${p.last_seen ? localDateTime(p.last_seen) : '—'}</td>
@@ -606,11 +650,13 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   app.post('/admin/people', async (c) => {
     const { v, error } = validatePerson(await form(c), { isNew: true });
     if (error) return peoplePage(c, { error, values: v }, 400);
+    const clash = await signInClash(c.get('db'), v);
+    if (clash) return peoplePage(c, { error: clash, values: v }, 400);
     try {
-      await c.get('db').run('INSERT INTO users (name, login, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?)',
-        v.name, v.login, await hashSecret(v.secret), v.role, v.hourly_rate);
+      await c.get('db').run('INSERT INTO users (name, login, short_name, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?, ?)',
+        v.name, v.login, v.short_name, await hashSecret(v.secret), v.role, v.hourly_rate);
     } catch (err) {
-      if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID or short name is already in use.', values: v }, 400);
       throw err;
     }
     return c.redirect(withMsg('/admin/people', `${v.name} added.`));
@@ -725,6 +771,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     v.active = b.active === '1' ? 1 : 0;
     const self = person.id === c.get('user').id;
     if (error) return personPage(c, person, { error, values: v }, 400);
+    const clash = await signInClash(db, v, person.id);
+    if (clash) return personPage(c, person, { error: clash, values: v }, 400);
     if (self && (!v.active || v.role !== 'supervisor')) {
       return personPage(c, person, { error: "You can't deactivate yourself or remove your own supervisor role.", values: v }, 400);
     }
@@ -732,18 +780,123 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       && await db.get('SELECT 1 AS x FROM shifts WHERE user_id = ? AND check_out_at IS NULL', person.id)) {
       return personPage(c, person, { error: 'This worker is still clocked in. Close their shift first.', values: v }, 400);
     }
-    const stmts = [['UPDATE users SET name = ?, login = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
-      v.name, v.login, v.role, v.hourly_rate, v.active, person.id]];
+    const stmts = [['UPDATE users SET name = ?, login = ?, short_name = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
+      v.name, v.login, v.short_name, v.role, v.hourly_rate, v.active, person.id]];
     if (v.secret) stmts.push(['UPDATE users SET secret_hash = ? WHERE id = ?', await hashSecret(v.secret), person.id]);
     // Sign the person out everywhere if their access changed.
     if (!self && (v.secret || !v.active || v.role !== person.role)) stmts.push(['DELETE FROM sessions WHERE user_id = ?', person.id]);
     try {
       await db.batch(stmts);
     } catch (err) {
-      if (isUnique(err)) return personPage(c, person, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return personPage(c, person, { error: 'That phone/staff ID or short name is already in use.', values: v }, 400);
       throw err;
     }
     return c.redirect(withMsg('/admin/people', `${v.name} saved.`));
+  });
+
+  // ---------- Selfies ----------
+  app.get('/admin/photos/:id', async (c) => {
+    const photo = await c.get('db').get('SELECT data FROM photos WHERE id = ?', Number(c.req.param('id')));
+    if (!photo) return c.notFound();
+    const bytes = Uint8Array.from(atob(photo.data), (ch) => ch.charCodeAt(0));
+    return c.body(bytes, 200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400' });
+  });
+
+  // ---------- Roster ----------
+  const dayHead = (date) => new Date(`${date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+
+  async function rosterPage(c, week, { error = null, values = null } = {}, status = 200) {
+    const db = c.get('db');
+    const days = Array.from({ length: 7 }, (_, i) => addDays(week, i));
+    const workers = await activeWorkers(db);
+    const rows = await db.all('SELECT * FROM roster WHERE work_date BETWEEN ? AND ? ORDER BY start_time', days[0], days[6]);
+    const cell = (uid, d) => {
+      if (values) return values[`r_${uid}_${d}`] ?? '';
+      return formatRanges(rows.filter((r) => r.user_id === uid && r.work_date === d));
+    };
+    const perDay = days.map((d) => new Set(rows.filter((r) => r.work_date === d).map((r) => r.user_id)).size);
+    const today = localDate();
+    const mode = (await getSettings(db)).schedule_mode;
+    return render(c, {
+      title: 'Roster',
+      active: 'roster',
+      error,
+      body: html`
+        <div class="row-between page-head">
+          <h1>Roster</h1>
+          <div class="month-nav">
+            <a class="btn btn-small" href="/admin/roster?week=${addDays(week, -7)}" aria-label="Previous week">‹</a>
+            <strong>Week of ${prettyDate(week)}</strong>
+            <a class="btn btn-small" href="/admin/roster?week=${addDays(week, 7)}" aria-label="Next week">›</a>
+          </div>
+        </div>
+        ${mode === 'off' ? html`<div class="alert alert-warn">Roster checks are off, so clock-ins aren't compared with this roster. Turn them on in <a href="/admin/settings">Settings</a>.</div>` : ''}
+        <section class="card">
+          <form method="post" action="/admin/roster" class="stack">
+            <input type="hidden" name="week" value="${week}">
+            <div class="table-wrap">
+              <table class="roster-table">
+                <thead><tr><th>Worker</th>${days.map((d, i) => html`<th class="${d === today ? 'today' : ''}">${dayHead(d)}<div class="muted small">${perDay[i]} rostered</div></th>`)}</tr></thead>
+                <tbody>
+                  ${workers.map((w) => html`
+                    <tr>
+                      <td>${w.name}</td>
+                      ${days.map((d) => html`<td class="${d === today ? 'today' : ''}"><input name="r_${w.id}_${d}" value="${cell(w.id, d)}" aria-label="${w.name} ${dayHead(d)}" placeholder="off" autocomplete="off"></td>`)}
+                    </tr>`)}
+                </tbody>
+              </table>
+            </div>
+            <p class="hint">Type the hours, e.g. <strong>10-15</strong>, <strong>10:00-15:00</strong> or <strong>6pm-11pm</strong>. Split shift: <strong>10-14, 17-22</strong>. Past midnight: <strong>18:00-01:00</strong>. Leave blank for a day off.</p>
+            <div class="action-row">
+              <button class="btn btn-primary" type="submit">Save roster</button>
+            </div>
+          </form>
+          <form method="post" action="/admin/roster/copy" class="action-row">
+            <input type="hidden" name="week" value="${week}">
+            <button class="btn" type="submit" data-confirm="Replace this week's roster with last week's?">Copy last week</button>
+          </form>
+        </section>`,
+    }, status);
+  }
+
+  const weekParam = (q) => weekStart(isDate(q) ? q : localDate());
+
+  app.get('/admin/roster', (c) => rosterPage(c, weekParam(c.req.query('week'))));
+
+  app.post('/admin/roster', async (c) => {
+    const db = c.get('db');
+    const b = await form(c);
+    const week = weekParam(b.week);
+    const days = Array.from({ length: 7 }, (_, i) => addDays(week, i));
+    const workers = await activeWorkers(db);
+    const stmts = [];
+    for (const w of workers) {
+      if (!days.some((d) => `r_${w.id}_${d}` in b)) continue; // not on the form (added since it was opened)
+      stmts.push(['DELETE FROM roster WHERE user_id = ? AND work_date BETWEEN ? AND ?', w.id, days[0], days[6]]);
+      for (const d of days) {
+        const parsed = parseRanges(b[`r_${w.id}_${d}`]);
+        if (parsed.error) return rosterPage(c, week, { error: `${w.name}, ${dayHead(d)}: ${parsed.error}`, values: b }, 400);
+        for (const r of parsed.ranges) {
+          stmts.push(['INSERT INTO roster (user_id, work_date, start_time, end_time) VALUES (?, ?, ?, ?)', w.id, d, r.start, r.end]);
+        }
+      }
+    }
+    await db.batch(stmts);
+    return c.redirect(withMsg(`/admin/roster?week=${week}`, 'Roster saved.'));
+  });
+
+  app.post('/admin/roster/copy', async (c) => {
+    const db = c.get('db');
+    const week = weekParam((await form(c)).week);
+    const from = addDays(week, -7);
+    await db.batch([
+      ['DELETE FROM roster WHERE work_date BETWEEN ? AND ?', week, addDays(week, 6)],
+      [`INSERT INTO roster (user_id, work_date, start_time, end_time)
+        SELECT r.user_id, date(r.work_date, '+7 days'), r.start_time, r.end_time FROM roster r
+        JOIN users u ON u.id = r.user_id AND u.active = 1
+        WHERE r.work_date BETWEEN ? AND ?`, from, addDays(from, 6)],
+    ]);
+    return c.redirect(withMsg(`/admin/roster?week=${week}`, 'Copied last week’s roster.'));
   });
 
   // ---------- Settings ----------
@@ -780,6 +933,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             <label>Alert when a worker uses this many different phones in 30 days
               <input type="number" name="device_alert_count" min="2" max="20" value="${s.device_alert_count}">
             </label>
+            <label>Selfie at clock-in
+              <select name="selfie_mode">
+                ${opt('selfie_mode', 'off', 'Off')}
+                ${opt('selfie_mode', 'flag', 'Ask for a selfie; flag if skipped')}
+                ${opt('selfie_mode', 'block', 'Selfie required to clock in')}
+              </select>
+              <span class="hint">Photos are small (about 30 KB), visible only to supervisors on the shift page, and deleted after ${PHOTO_KEEP_DAYS} days.</span>
+            </label>
             <label>Venue WiFi (public IP address)
               <select name="ip_mode">
                 ${opt('ip_mode', 'off', 'Off')}
@@ -791,6 +952,23 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <textarea name="allowed_ips" rows="2" placeholder="e.g. 203.0.113.25, 198.51.100.0/24">${s.allowed_ips}</textarea>
               <span class="hint">Your current IP address is <strong>${normalizeIp(c.get('ip'))}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
             </label>
+            <h3>Roster and lateness</h3>
+            <label>Compare clock-ins with the roster
+              <select name="schedule_mode">
+                ${opt('schedule_mode', 'off', 'Off — no roster')}
+                ${opt('schedule_mode', 'flag', 'Flag late, too-early and not-rostered clock-ins (recommended)')}
+                ${opt('schedule_mode', 'block', 'Flag lateness; only allow clock-in during rostered shifts')}
+              </select>
+              <span class="hint">Fill in who works when on the <a href="/admin/roster">Roster</a> page. Late arrivals are always allowed, just flagged.</span>
+            </label>
+            <div class="grid-2">
+              <label>Late after (minutes past the rostered start)
+                <input type="number" name="late_grace_min" min="0" max="60" value="${s.late_grace_min}">
+              </label>
+              <label>Clock-in opens (minutes before the rostered start)
+                <input type="number" name="early_clockin_min" min="0" max="240" value="${s.early_clockin_min}">
+              </label>
+            </div>
             <div><button class="btn btn-primary" type="submit">Save settings</button></div>
           </form>
         </section>
@@ -827,12 +1005,20 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const b = await form(c);
     const pick = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
     const alertCount = Math.round(Number(b.device_alert_count));
+    const minutes = (v, max, fallback) => {
+      const n = Math.round(Number(v));
+      return v !== '' && n >= 0 && n <= max ? n : fallback;
+    };
     await c.get('db').batch([
       setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag')),
       setSettingStmt('ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('allowed_ips', String(b.allowed_ips || '').slice(0, 2000)),
       setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),
       setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
+      setSettingStmt('selfie_mode', pick(b.selfie_mode, ['off', 'flag', 'block'], 'off')),
+      setSettingStmt('schedule_mode', pick(b.schedule_mode, ['off', 'flag', 'block'], 'off')),
+      setSettingStmt('late_grace_min', minutes(b.late_grace_min, 60, 5)),
+      setSettingStmt('early_clockin_min', minutes(b.early_clockin_min, 240, 30)),
     ]);
     return c.redirect(withMsg('/admin/settings', 'Settings saved.'));
   });
@@ -929,31 +1115,35 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   app.get('/admin/export/summary.csv', async (c) => {
     const ym = monthParam(c.req.query('month'));
     const rep = await monthReport(c.get('db'), ym);
+    const withRoster = (await getSettings(c.get('db'))).schedule_mode !== 'off';
     const dayCols = Array.from({ length: rep.nDays }, (_, i) => dayLabel(ym, i + 1));
     const rows = [[
       'Month', 'Worker ID', 'Name', 'Phone / Staff ID', 'Days Worked', 'Shifts', 'Approved Hours', 'Pending Hours',
-      'Rejected Hours', 'Not Clocked Out', 'Hourly Rate', 'Approved Pay', ...dayCols,
+      'Rejected Hours', 'Not Clocked Out', 'Hourly Rate', 'Approved Pay', ...(withRoster ? ['Times Late', 'Minutes Late'] : []), ...dayCols,
     ]];
     for (const r of rep.rows) {
       rows.push([
         ym, r.worker.id, r.worker.name, r.worker.login, r.daysWorked, r.shifts, r.approved, r.pending,
-        r.rejected, r.open, r.worker.hourly_rate, r.pay, ...r.daily.map((h) => h || ''),
+        r.rejected, r.open, r.worker.hourly_rate, r.pay, ...(withRoster ? [r.late, r.lateMin] : []), ...r.daily.map((h) => h || ''),
       ]);
     }
     const t = rep.totals;
-    rows.push([ym, '', 'TOTAL', '', t.daysWorked, t.shifts, t.approved, t.pending, t.rejected, t.open, '', t.pay, ...t.daily.map((h) => h || '')]);
+    rows.push([ym, '', 'TOTAL', '', t.daysWorked, t.shifts, t.approved, t.pending, t.rejected, t.open, '', t.pay,
+      ...(withRoster ? [t.late, t.lateMin] : []), ...t.daily.map((h) => h || '')]);
     return sendCsv(c, `attendance-summary-${ym}.csv`, rows);
   });
 
   app.get('/admin/export/detail.csv', async (c) => {
     const ym = monthParam(c.req.query('month'));
     const rep = await monthReport(c.get('db'), ym);
+    const withRoster = (await getSettings(c.get('db'))).schedule_mode !== 'off';
     const rows = [[
       'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out',
       'Check In (rounded)', 'Check Out (rounded)', 'Hours', 'Actual Hours', 'Status',
       'Approved/Rejected By', 'Approved/Rejected At', 'Review Note', 'Worker Note',
       'Check-in Site', 'Check-in Distance (m)', 'Check-in GPS', 'Check-out Site', 'Check-out Distance (m)', 'Check-out GPS',
       'Check-in Device', 'Check-out Device', 'Flags', 'Shift ID',
+      ...(withRoster ? ['Rostered Start', 'Rostered End', 'Minutes Late'] : []),
     ]];
     const gps = (lat, lng) => (lat == null ? '' : `${lat.toFixed(6)} ${lng.toFixed(6)}`);
     const shifts = [...rep.shifts].sort((a, b) => a.work_date.localeCompare(b.work_date) || a.name.localeCompare(b.name) || a.check_in_at.localeCompare(b.check_in_at));
@@ -971,8 +1161,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         s.in_site || '', s.in_distance_m ?? '', gps(s.in_lat, s.in_lng),
         s.out_site || '', s.out_distance_m ?? '', gps(s.out_lat, s.out_lng),
         deviceName(s.in_device_label, s.in_device_key) || '', deviceName(s.out_device_label, s.out_device_key) || '',
-        String(s.flags || '').split(',').filter(Boolean).map((f) => FLAG_LABELS[f] || f).join('; '),
+        String(s.flags || '').split(',').filter(Boolean).map((f) => flagLabel(f, { lateMin: minutesLate(s) })).join('; '),
         s.id,
+        ...(withRoster ? [localDateTime(s.sched_start), localDateTime(s.sched_end), hasFlag(s.flags, 'in:late') ? minutesLate(s) : ''] : []),
       ]);
     }
     return sendCsv(c, `attendance-detail-${ym}.csv`, rows);

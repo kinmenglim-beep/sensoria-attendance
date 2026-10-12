@@ -62,9 +62,9 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
   async function render(c, opts, status = 200) {
     const user = c.get('user');
     const flash = opts.flash !== undefined ? opts.flash : (c.req.query('ok') ?? null);
-    // The Roster menu item only appears once roster checks are switched on in Settings.
-    const roster = user?.role === 'supervisor' && (await getSettings(c.get('db'))).schedule_mode !== 'off';
-    return c.html(layout({ user, ...opts, flash, roster }), status);
+    // The Attendance menu item only appears once the attendance record is switched on in Settings.
+    const attendance = user?.role === 'supervisor' && (await getSettings(c.get('db'))).attendance_mode === 'on';
+    return c.html(layout({ user, ...opts, flash, attendance }), status);
   }
 
   /** Parsed form body; repeated fields (e.g. ids) come back as arrays. */

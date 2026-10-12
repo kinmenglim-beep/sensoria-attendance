@@ -1,4 +1,4 @@
-import { getSettings, auditStmt, addFlags, PHOTO_KEEP_DAYS } from '../db.js';
+import { getSettings, auditStmt, addFlags, removeFlags, PHOTO_KEEP_DAYS } from '../db.js';
 import { envVar } from '../env.js';
 import {
   TZ, localDate, localTime, roundTime, addDays, addMonths, paidHours, formatDuration, formatHM, prettyDate, prettyMonth, isMonth,
@@ -7,7 +7,10 @@ import { checkGeofence, normalizeIp, parseAllowList, ipAllowed } from '../verify
 import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { round2 } from '../report.js';
 import { resolveDevice, checkRegistration, recentDeviceCount } from '../device.js';
-import { rosterSlots, matchSlot, minutesLate, minutesEarly } from '../schedule.js';
+import {
+  workRanges, daySlots, matchSlot, weekStart, minutesLate, minutesEarly,
+} from '../schedule.js';
+import { daysOff } from '../attendance.js';
 
 // Selfies arrive as a small JPEG data URL (the phone shrinks the photo before upload).
 const SELFIE_RE = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/;
@@ -36,8 +39,20 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     const todays = await db.all('SELECT * FROM shifts WHERE user_id = ? AND work_date = ? ORDER BY check_in_at', user.id, today);
     const action = open ? 'out' : 'in';
     const workedToday = todays.reduce((a, x) => a + (x.check_out_at ? paidHours(x.check_in_at, x.check_out_at) : 0), 0);
-    const roster = s.schedule_mode !== 'off' ? await rosterSlots(db, user.id, today, addDays(today, 6)) : [];
-    const todaysRoster = roster.filter((r) => r.work_date === today);
+    const tracking = s.attendance_mode === 'on';
+    const hours = workRanges(user, s);
+    // Days off taken so far this week (today counts once its working hours are over).
+    let offThisWeek = 0;
+    if (tracking) {
+      const week = weekStart(today);
+      const worked = new Set((await db.all('SELECT DISTINCT work_date FROM shifts WHERE user_id = ? AND work_date BETWEEN ? AND ?', user.id, week, today))
+        .map((r) => r.work_date));
+      const created = (await db.get('SELECT created_at FROM users WHERE id = ?', user.id)).created_at;
+      const todaySlots = daySlots(hours, today);
+      const over = !todaySlots.length || Date.parse(todaySlots[todaySlots.length - 1].endIso) <= Date.now();
+      offThisWeek = daysOff(worked, week, over ? today : addDays(today, -1), created).length;
+    }
+    const allowance = Number(s.days_off_per_week) || 0;
     const askSelfie = !open && s.selfie_mode !== 'off';
 
     return render(c, {
@@ -54,9 +69,8 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                      · <span data-elapsed-since="${open.check_in_at}">${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></p>`
             : html`<h1 class="clock-status">You're not clocked in</h1>
                    <p class="clock-since" data-clock="${TZ}"></p>`}
-          ${s.schedule_mode !== 'off' ? html`<p class="roster-today">${todaysRoster.length
-            ? html`Today's shift: <strong>${todaysRoster.map((r) => `${r.start_time}–${r.end_time}`).join(', ')}</strong>`
-            : html`<span class="muted">You're not on the roster today.</span>`}</p>` : ''}
+          ${tracking && hours.length ? html`<p class="roster-today">Working hours: <strong>${hours.map((r) => `${r.start}–${r.end}`).join(', ')}</strong></p>
+            <p class="roster-today ${offThisWeek > allowance ? 'flag' : 'muted'}">Days off this week: ${offThisWeek} of ${allowance}</p>` : ''}
 
           <form id="clock-form" class="stack" data-action="${action}" data-location="${s.geofence_mode}" data-selfie="${askSelfie ? s.selfie_mode : 'off'}">
             ${askSelfie ? html`
@@ -89,17 +103,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                 </li>`)}
             </ul>` : html`<p class="muted">No shifts yet today.</p>`}
           <p><a href="/me">See all my hours →</a></p>
-        </section>
-        ${roster.length ? html`
-          <section class="card">
-            <h2>My roster</h2>
-            <ul class="shift-list">
-              ${Array.from({ length: 7 }, (_, i) => addDays(today, i)).map((d) => {
-                const day = roster.filter((r) => r.work_date === d);
-                return html`<li><span>${dayName(d, today)}</span><span>${day.length ? day.map((r) => `${r.start_time}–${r.end_time}`).join(', ') : html`<span class="muted">Off</span>`}</span></li>`;
-              })}
-            </ul>
-          </section>` : ''}`,
+        </section>`,
     });
   });
 
@@ -164,34 +168,28 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       flags.push(`${p}:off_network`);
     }
 
-    // 3. Roster: late, too early, not rostered. Being late never blocks; it is only flagged.
+    // 3. Working hours: late arrival / early leave. Never blocks; only flagged.
     let sched = { start: null, end: null };
     let lateMin = 0;
-    if (action === 'in' && s.schedule_mode !== 'off') {
+    const backFromBreak = [];
+    if (action === 'in' && s.attendance_mode === 'on') {
       const today = localDate();
-      const slots = await rosterSlots(db, uid, addDays(today, -1), today);
-      const m = matchSlot(slots, Date.now(), { earlyMin: Number(s.early_clockin_min) || 0, graceMin: Number(s.late_grace_min) || 0 });
-      if (m.status === 'none' || m.status === 'too_early') {
-        if (s.schedule_mode === 'block') {
-          return c.json({
-            error: m.status === 'none'
-              ? "You're not on the roster right now. Please check with your manager."
-              : `Your shift starts at ${localTime(m.slot.startIso)}. You can clock in from ${localTime(m.opensAt)}.`,
-          }, 403);
-        }
-        flags.push(m.status === 'none' ? 'in:unscheduled' : 'in:too_early');
-      }
-      if (m.slot) {
+      const hours = workRanges(c.get('user'), s);
+      const slots = [...daySlots(hours, addDays(today, -1)), ...daySlots(hours, today)];
+      // Anything from 3 hours before the start counts as clocking in for that block.
+      const m = matchSlot(slots, Date.now(), { earlyMin: 180, graceMin: Number(s.late_grace_min) || 0 });
+      if (m.status === 'ok' || m.status === 'late') {
         sched = { start: m.slot.startIso, end: m.slot.endIso };
-        // Coming back from a break within the same rostered shift isn't late again.
-        const again = await db.get('SELECT 1 AS x FROM shifts WHERE user_id = ? AND sched_start = ? LIMIT 1', uid, sched.start);
-        if (m.status === 'late' && !again) {
+        // Coming back from a break within the same working hours: not late again, and the
+        // earlier clock-out wasn't leaving early after all.
+        backFromBreak.push(...await db.all('SELECT id, flags FROM shifts WHERE user_id = ? AND sched_start = ?', uid, sched.start));
+        if (m.status === 'late' && !backFromBreak.length) {
           flags.push('in:late');
           lateMin = m.lateMin;
         }
       }
     }
-    if (action === 'out' && open.sched_end && s.schedule_mode !== 'off'
+    if (action === 'out' && open.sched_end && s.attendance_mode === 'on'
       && Date.now() < Date.parse(open.sched_end) - (Number(s.late_grace_min) || 0) * 60000) {
       flags.push('out:left_early');
     }
@@ -242,6 +240,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         const results = await db.batch(stmts);
         const shiftId = results[results.length - 1].lastId;
         const after = [auditStmt(shiftId, uid, 'clock_in')];
+        for (const x of backFromBreak) after.push(['UPDATE shifts SET flags = ? WHERE id = ?', removeFlags(x.flags, 'out:left_early'), x.id]);
         if (selfie) {
           after.push(['INSERT INTO photos (shift_id, kind, data, taken_at) VALUES (?, ?, ?, ?)', shiftId, 'in', selfie, now]);
           after.push(['DELETE FROM photos WHERE taken_at < ?', new Date(Date.now() - PHOTO_KEEP_DAYS * 86400000).toISOString()]);
@@ -249,7 +248,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         await db.batch(after);
         // Device flags are for supervisors only, so only location/network issues are mentioned here.
         const reviewNeeded = flags.some((f) => /no_location|outside_area|off_network/.test(f));
-        const timing = lateMin ? ` You're ${lateMin} min late.` : flags.includes('in:unscheduled') ? " You're not on the roster now." : '';
+        const timing = lateMin ? ` You're ${lateMin} min late.` : '';
         return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked in at ${localTime(now)}.${timing}${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
       }
 
@@ -325,9 +324,3 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
   });
 }
 
-/** "Today", "Tomorrow" or "Mon 12 Oct". */
-function dayName(date, today) {
-  if (date === today) return 'Today';
-  if (date === addDays(today, 1)) return 'Tomorrow';
-  return prettyDate(date).replace(/ \d{4}$/, '');
-}

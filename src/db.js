@@ -4,11 +4,13 @@
 
 const SCHEMA = [
   // short_name: optional short sign-in name such as initials ("KML").
+  // work_hours: this person's working hours if different from everyone's, e.g. "10:00-22:00".
   `CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
     login       TEXT NOT NULL UNIQUE COLLATE NOCASE,
     short_name  TEXT COLLATE NOCASE,
+    work_hours  TEXT,
     secret_hash TEXT NOT NULL,
     role        TEXT NOT NULL CHECK (role IN ('worker', 'supervisor')),
     hourly_rate REAL,
@@ -60,7 +62,7 @@ const SCHEMA = [
   )`,
   // One row per check-in/check-out pair. Times are stored as UTC ISO strings;
   // work_date is the local (APP_TZ) date of the check-in. sched_start/sched_end:
-  // the rostered shift the check-in was matched to, if any.
+  // the block of working hours the check-in was matched to, if any.
   `CREATE TABLE IF NOT EXISTS shifts (
     id            INTEGER PRIMARY KEY,
     user_id       INTEGER NOT NULL REFERENCES users(id),
@@ -94,25 +96,6 @@ const SCHEMA = [
     at       TEXT NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS audit_by_shift ON audit(shift_id)',
-  // Rostered working hours: one row per shift (a split shift is two rows).
-  // Times are local HH:MM; an end before the start means the shift ends the next day.
-  `CREATE TABLE IF NOT EXISTS roster (
-    id         INTEGER PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    work_date  TEXT NOT NULL,
-    start_time TEXT NOT NULL,
-    end_time   TEXT NOT NULL
-  )`,
-  'CREATE INDEX IF NOT EXISTS roster_by_date ON roster(work_date, user_id)',
-  // Each worker's usual weekly hours (weekday 0 = Monday). Roster rows for a date replace these;
-  // a roster row with start_time 'off' marks a usual working day as off.
-  `CREATE TABLE IF NOT EXISTS usual_hours (
-    id         INTEGER PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    weekday    INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
-    start_time TEXT NOT NULL,
-    end_time   TEXT NOT NULL
-  )`,
   // Clock-in selfies, stored as base64 JPEG (~30 KB each) and pruned after PHOTO_KEEP_DAYS.
   `CREATE TABLE IF NOT EXISTS photos (
     id       INTEGER PRIMARY KEY,
@@ -127,6 +110,7 @@ const SCHEMA = [
 // Columns added after the first release; older databases get them via ALTER TABLE.
 const ADDED_COLUMNS = [
   ['users', 'short_name', 'TEXT COLLATE NOCASE'],
+  ['users', 'work_hours', 'TEXT'],
   ['shifts', 'sched_start', 'TEXT'],
   ['shifts', 'sched_end', 'TEXT'],
 ];
@@ -148,12 +132,14 @@ export const DEFAULT_SETTINGS = {
   device_mode: 'flag',
   // Alert when a worker uses this many different phones within 30 days.
   device_alert_count: '3',
-  // off | flag | block — compare clock-ins with the roster (late, too early, not rostered).
-  schedule_mode: 'off',
+  // off | on — keep an attendance record: late arrivals, early leaves, extra days off.
+  attendance_mode: 'off',
+  // Everyone's working hours (a person can have their own on the People page). Split shift: "10-14, 17-22".
+  work_hours: '10:00-22:00',
+  // Days a person may skip per week (Monday to Sunday) before it counts as an extra day off.
+  days_off_per_week: '1',
   // Minutes of leeway before arriving counts as late, or leaving counts as early.
   late_grace_min: '5',
-  // How many minutes before the rostered start a worker may clock in.
-  early_clockin_min: '30',
   // off | flag | block — selfie at clock-in: off, ask (flag if skipped), or required.
   selfie_mode: 'off',
 };

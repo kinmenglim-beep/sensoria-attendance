@@ -14,9 +14,9 @@ import {
   deviceName, frequentDeviceChangers, recentDeviceCount, DEVICE_COLUMNS, DEVICE_JOINS,
 } from '../device.js';
 import {
-  parseRanges, formatRanges, slotTimes, weekStart, weekdayIndex, minutesLate, minutesEarly, effectiveRoster, rosterSlots, OFF,
+  parseRanges, formatRanges, weekStart, workRanges, daySlots, minutesLate, minutesEarly,
 } from '../schedule.js';
-import { attendanceReport } from '../attendance.js';
+import { attendanceReport, daysOff } from '../attendance.js';
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -47,7 +47,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   const shiftHours = (s) => (s.check_out_at ? paidHours(s.check_in_at, s.check_out_at) : null);
   // Auto-closed shifts need a real check-out time before they can be approved.
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
-  const activeWorkers = (db) => db.all("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
+  const activeWorkers = (db) => db.all("SELECT id, name, work_hours, created_at FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
 
   /** Table of shifts with optional checkboxes for bulk approval. */
   function shiftTable(shifts, { showDate = false, back = '/admin' } = {}) {
@@ -107,19 +107,12 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       byUser.get(s.user_id).push(s);
     }
     const settings = await getSettings(db);
-    // With a roster for the day, "not clocked in" only lists people rostered to work; the rest are off.
-    const rosterRows = settings.schedule_mode === 'off' ? [] : await effectiveRoster(db, date, date);
-    const rostered = new Map();
-    for (const r of rosterRows) {
-      if (!rostered.has(r.user_id)) rostered.set(r.user_id, []);
-      rostered.get(r.user_id).push(r);
-    }
-    const working = []; const done = []; const absent = []; const off = [];
+    const tracking = settings.attendance_mode === 'on';
+    const working = []; const done = []; const absent = [];
     for (const w of workers) {
       const list = byUser.get(w.id) || [];
       const open = list.find((s) => !s.check_out_at);
-      if (!list.length && rosterRows.length && !rostered.has(w.id)) off.push(w);
-      else if (!list.length) absent.push({ ...w, roster: rostered.get(w.id) || [] });
+      if (!list.length) absent.push(w);
       else if (open) working.push({ w, open });
       else done.push({ w, hours: list.reduce((a, s) => a + shiftHours(s), 0), last: list[list.length - 1].check_out_at });
     }
@@ -131,16 +124,29 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
     const back = `/admin?date=${date}`;
     const graceMs = (Number(settings.late_grace_min) || 0) * 60000;
-    /** "rostered 10:00-14:00", "late 12m" once the current rostered shift has started, or "missed". */
+    const allowance = Number(settings.days_off_per_week) || 0;
+    // Days off each absent person already took earlier this week.
+    const week = weekStart(date);
+    const workedThisWeek = new Set(tracking ? (await db.all('SELECT DISTINCT user_id, work_date FROM shifts WHERE work_date BETWEEN ? AND ?', week, date))
+      .map((r) => `${r.user_id}|${r.work_date}`) : []);
+    const offBefore = (w) => (date > week
+      ? daysOff(new Set([...workedThisWeek].filter((k) => k.startsWith(`${w.id}|`)).map((k) => k.split('|')[1])), week, addDays(date, -1), w.created_at).length
+      : 0);
+    /**
+     * For someone not clocked in: "starts 10:00", "not in yet" (may be their day off), "day off",
+     * flagged when they already had their days off this week.
+     */
     const dueLabel = (w) => {
-      if (!w.roster.length) return '';
-      const times = formatRanges(w.roster);
-      const slots = w.roster.map((r) => slotTimes(date, r.start_time, r.end_time));
+      if (!tracking) return '';
+      const slots = daySlots(workRanges(w, settings), date);
+      if (!slots.length) return '';
+      const prev = offBefore(w);
+      const extra = prev >= allowance;
+      const already = extra && prev ? html` <span class="flag">already ${prev} day${prev === 1 ? '' : 's'} off this week</span>` : '';
       const current = slots.find((x) => Date.now() <= Date.parse(x.endIso));
-      if (!current) return html`<span class="flag">missed</span> <span class="muted small">${times}</span>`;
-      const lateMs = Date.now() - Date.parse(current.startIso);
-      if (lateMs > graceMs) return html`<span class="flag">late ${formatDuration(lateMs)}</span> <span class="muted small">${times}</span>`;
-      return html`<span class="muted small">rostered ${times}</span>`;
+      if (!current) return extra ? html`<span class="flag">extra day off</span>${already}` : html`<span class="muted small">day off</span>`;
+      if (Date.now() - Date.parse(current.startIso) > graceMs) return html`<span class="muted small">not in yet</span>${already}`;
+      return html`<span class="muted small">starts ${localTime(current.startIso)}</span>${already}`;
     };
     const alertCount = Number(settings.device_alert_count) || 0;
     const deviceChangers = alertCount >= 2 ? await frequentDeviceChangers(db, alertCount) : [];
@@ -203,7 +209,6 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             ${absent.length ? html`<ul class="people-list">
               ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
             </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
-            ${off.length ? html`<p class="muted small">Off (not rostered): ${off.map((w) => w.name).join(', ')}</p>` : ''}
           </div>
           <div class="card">
             <h2>Working now <span class="count">${working.length}</span></h2>
@@ -380,8 +385,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const approve = b.approve === '1';
     const userId = c.get('user').id;
     const now = new Date().toISOString();
-    // Link it to the rostered shift it overlaps, so it counts on the attendance record.
-    const slot = (await rosterSlots(db, worker.id, addDays(t.date, -1), t.date)).find((x) => t.inIso < x.endIso && t.outIso > x.startIso);
+    // Link it to the working hours it overlaps, like a normal clock-in.
+    const hours = workRanges(await db.get('SELECT work_hours FROM users WHERE id = ?', worker.id), await getSettings(db));
+    const slot = [...daySlots(hours, addDays(t.date, -1)), ...daySlots(hours, t.date)].find((x) => t.inIso < x.endIso && t.outIso > x.startIso);
     const { lastId: id } = await db.run(`
       INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, sched_start, sched_end, flags, status, reviewed_by, reviewed_at)
       VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)
@@ -445,7 +451,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               ${shift.review_note ? html`<div class="small">“${shift.review_note}”</div>` : ''}
             </div>
           </div>
-          ${shift.sched_start ? html`<p><span class="label">Rostered</span> ${localTime(shift.sched_start)}–${localTime(shift.sched_end)}${minutesLate(shift) ? html` · clocked in ${minutesLate(shift)} min after the start` : ''}</p>` : ''}
+          ${shift.sched_start ? html`<p><span class="label">Working hours</span> ${localTime(shift.sched_start)}–${localTime(shift.sched_end)}${minutesLate(shift) ? html` · clocked in ${minutesLate(shift)} min after the start` : ''}</p>` : ''}
           ${shift.flags ? html`<p>${flagList(shift.flags, { lateMin: minutesLate(shift), earlyMin: minutesEarly(shift) })}</p>` : ''}
           ${shift.worker_note ? html`<p><span class="label">Worker note</span> ${shift.worker_note}</p>` : ''}
 
@@ -554,6 +560,10 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <input name="short_name" value="${values.short_name || ''}" maxlength="12" autocapitalize="characters" placeholder="e.g. KML">
           <span class="hint">Initials or a nickname: 2–12 letters or digits, easier to type than a phone number.</span>
         </label>
+        <label>Working hours (optional)
+          <input name="work_hours" value="${values.work_hours || ''}" maxlength="40" placeholder="Same as everyone">
+          <span class="hint">Only if this person's hours differ from the usual ones in Settings, e.g. 17:00-23:00.</span>
+        </label>
         <label>Role
           <select name="role" data-role-select>
             <option value="worker" ${values.role !== 'supervisor' ? 'selected' : ''}>Worker</option>
@@ -575,6 +585,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       name: String(b.name || '').trim(),
       login: String(b.login || '').trim(),
       short_name: String(b.short_name || '').trim() || null,
+      work_hours: String(b.work_hours || '').trim() || null,
       role: b.role === 'supervisor' ? 'supervisor' : 'worker',
       hourly_rate: b.hourly_rate === '' || b.hourly_rate === undefined ? null : Number(b.hourly_rate),
       secret: String(b.secret || ''),
@@ -582,6 +593,11 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     if (!v.name || !v.login) return { v, error: 'Name and phone/staff ID are required.' };
     if (v.hourly_rate !== null && !(v.hourly_rate >= 0)) return { v, error: 'Hourly rate must be a positive number.' };
     if (v.short_name && !/^[A-Za-z0-9]{2,12}$/.test(v.short_name)) return { v, error: 'Short name: 2–12 letters or digits, no spaces.' };
+    if (v.work_hours) {
+      const parsed = parseRanges(v.work_hours);
+      if (parsed.error || !parsed.ranges.length) return { v, error: `Working hours: ${parsed.error || 'enter them like 10:00-22:00, or leave blank.'}` };
+      v.work_hours = formatRanges(parsed.ranges);
+    }
     if (isNew || v.secret) {
       if (v.role === 'supervisor' && v.secret.length < 8) return { v, error: 'Supervisor passwords need at least 8 characters.' };
       if (v.role === 'worker' && v.secret.length < 4) return { v, error: 'Worker PINs need at least 4 characters.' };
@@ -657,8 +673,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const clash = await signInClash(c.get('db'), v);
     if (clash) return peoplePage(c, { error: clash, values: v }, 400);
     try {
-      await c.get('db').run('INSERT INTO users (name, login, short_name, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?, ?)',
-        v.name, v.login, v.short_name, await hashSecret(v.secret), v.role, v.hourly_rate);
+      await c.get('db').run('INSERT INTO users (name, login, short_name, work_hours, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        v.name, v.login, v.short_name, v.work_hours, await hashSecret(v.secret), v.role, v.hourly_rate);
     } catch (err) {
       if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID or short name is already in use.', values: v }, 400);
       throw err;
@@ -784,8 +800,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       && await db.get('SELECT 1 AS x FROM shifts WHERE user_id = ? AND check_out_at IS NULL', person.id)) {
       return personPage(c, person, { error: 'This worker is still clocked in. Close their shift first.', values: v }, 400);
     }
-    const stmts = [['UPDATE users SET name = ?, login = ?, short_name = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
-      v.name, v.login, v.short_name, v.role, v.hourly_rate, v.active, person.id]];
+    const stmts = [['UPDATE users SET name = ?, login = ?, short_name = ?, work_hours = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
+      v.name, v.login, v.short_name, v.work_hours, v.role, v.hourly_rate, v.active, person.id]];
     if (v.secret) stmts.push(['UPDATE users SET secret_hash = ? WHERE id = ?', await hashSecret(v.secret), person.id]);
     // Sign the person out everywhere if their access changed.
     if (!self && (v.secret || !v.active || v.role !== person.role)) stmts.push(['DELETE FROM sessions WHERE user_id = ?', person.id]);
@@ -806,189 +822,25 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     return c.body(bytes, 200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400' });
   });
 
-  // ---------- Roster: usual weekly hours, plus changes for particular days ----------
-  const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const dayHead = (date) => new Date(`${date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
-  const RANGE_HINT = html`<p class="hint">Type the hours, e.g. <strong>10-22</strong>, <strong>10:00-15:00</strong> or <strong>6pm-11pm</strong>. Split shift: <strong>10-14, 17-22</strong>. Past midnight: <strong>18:00-01:00</strong>. Leave blank for a day off.</p>`;
-
-  function rosterTabs(active, week) {
-    return html`<div class="tabs">
-      <a class="${active === 'week' ? 'active' : ''}" href="/admin/roster${week ? `?week=${week}` : ''}">Week by week</a>
-      <a class="${active === 'usual' ? 'active' : ''}" href="/admin/roster/usual">Usual hours</a>
-    </div>`;
-  }
-
-  /** Table of text boxes: one row per worker, one column per day. */
-  const hoursGrid = (workers, columns, cell) => html`
-    <div class="table-wrap">
-      <table class="roster-table">
-        <thead><tr><th>Worker</th>${columns.map((col) => html`<th class="${col.cls || ''}">${col.head}</th>`)}</tr></thead>
-        <tbody>
-          ${workers.map((w) => html`
-            <tr>
-              <td>${w.name}</td>
-              ${columns.map((col) => {
-                const x = cell(w, col);
-                return html`<td class="${col.cls || ''} ${x.cls || ''}"><input name="${x.name}" value="${x.value}" aria-label="${w.name} ${col.label}" placeholder="off" autocomplete="off"></td>`;
-              })}
-            </tr>`)}
-        </tbody>
-      </table>
-    </div>`;
-
-  async function usualHours(db) {
-    const map = new Map(); // "uid|weekday" -> rows
-    for (const r of await db.all('SELECT * FROM usual_hours ORDER BY start_time')) {
-      const k = `${r.user_id}|${r.weekday}`;
-      if (!map.has(k)) map.set(k, []);
-      map.get(k).push(r);
-    }
-    return (uid, wd) => map.get(`${uid}|${wd}`) || [];
-  }
-
-  async function usualPage(c, { error = null, values = null } = {}, status = 200) {
-    const db = c.get('db');
-    const workers = await activeWorkers(db);
-    const usual = await usualHours(db);
-    const columns = WEEKDAYS.map((d, wd) => ({ wd, head: d, label: d }));
-    return render(c, {
-      title: 'Usual hours',
-      active: 'roster',
-      error,
-      body: html`
-        <div class="page-head"><h1>Roster</h1></div>
-        ${rosterTabs('usual')}
-        <section class="card">
-          <h2>Usual working hours</h2>
-          <p class="muted">Each person's normal week. It applies every week unless you change a particular day under <a href="/admin/roster">Week by week</a>.</p>
-          <form method="post" action="/admin/roster/usual" class="stack">
-            ${hoursGrid(workers, columns, (w, col) => {
-              const name = `u_${w.id}_${col.wd}`;
-              return { name, value: values ? values[name] ?? '' : formatRanges(usual(w.id, col.wd)) };
-            })}
-            ${RANGE_HINT}
-            <div><button class="btn btn-primary" type="submit">Save usual hours</button></div>
-          </form>
-        </section>`,
-    }, status);
-  }
-
-  app.get('/admin/roster/usual', (c) => usualPage(c));
-
-  app.post('/admin/roster/usual', async (c) => {
-    const db = c.get('db');
-    const b = await form(c);
-    const stmts = [];
-    for (const w of await activeWorkers(db)) {
-      if (!WEEKDAYS.some((_, wd) => `u_${w.id}_${wd}` in b)) continue; // not on the form (added since it was opened)
-      stmts.push(['DELETE FROM usual_hours WHERE user_id = ?', w.id]);
-      for (let wd = 0; wd < 7; wd++) {
-        const parsed = parseRanges(b[`u_${w.id}_${wd}`]);
-        if (parsed.error) return usualPage(c, { error: `${w.name}, ${WEEKDAYS[wd]}: ${parsed.error}`, values: b }, 400);
-        for (const r of parsed.ranges) {
-          stmts.push(['INSERT INTO usual_hours (user_id, weekday, start_time, end_time) VALUES (?, ?, ?, ?)', w.id, wd, r.start, r.end]);
-        }
-      }
-    }
-    await db.batch(stmts);
-    return c.redirect(withMsg('/admin/roster/usual', 'Usual hours saved.'));
-  });
-
-  async function rosterPage(c, week, { error = null, values = null } = {}, status = 200) {
-    const db = c.get('db');
-    const days = Array.from({ length: 7 }, (_, i) => addDays(week, i));
-    const workers = await activeWorkers(db);
-    const rows = await effectiveRoster(db, days[0], days[6]);
-    const changed = new Set((await db.all('SELECT DISTINCT user_id, work_date FROM roster WHERE work_date BETWEEN ? AND ?', days[0], days[6]))
-      .map((r) => `${r.user_id}|${r.work_date}`));
-    const today = localDate();
-    const columns = days.map((d) => ({
-      d,
-      label: dayHead(d),
-      cls: d === today ? 'today' : '',
-      head: html`${dayHead(d)}<div class="muted small">${new Set(rows.filter((r) => r.work_date === d).map((r) => r.user_id)).size} working</div>`,
-    }));
-    const mode = (await getSettings(db)).schedule_mode;
-    return render(c, {
-      title: 'Roster',
-      active: 'roster',
-      error,
-      body: html`
-        <div class="row-between page-head">
-          <h1>Roster</h1>
-          <div class="month-nav">
-            <a class="btn btn-small" href="/admin/roster?week=${addDays(week, -7)}" aria-label="Previous week">‹</a>
-            <strong>Week of ${prettyDate(week)}</strong>
-            <a class="btn btn-small" href="/admin/roster?week=${addDays(week, 7)}" aria-label="Next week">›</a>
-          </div>
-        </div>
-        ${rosterTabs('week', week)}
-        ${mode === 'off' ? html`<div class="alert alert-warn">Roster checks are off, so clock-ins aren't compared with the roster. Turn them on in <a href="/admin/settings">Settings</a>.</div>` : ''}
-        <section class="card">
-          <p class="muted">This week starts from everyone's <a href="/admin/roster/usual">usual hours</a>. Change a box for leave, a swapped shift or extra hours; changed days are highlighted. Put a day back to the usual hours to undo.</p>
-          <form method="post" action="/admin/roster" class="stack">
-            <input type="hidden" name="week" value="${week}">
-            ${hoursGrid(workers, columns, (w, col) => {
-              const name = `r_${w.id}_${col.d}`;
-              return {
-                name,
-                value: values ? values[name] ?? '' : formatRanges(rows.filter((r) => r.user_id === w.id && r.work_date === col.d)),
-                cls: changed.has(`${w.id}|${col.d}`) ? 'override' : '',
-              };
-            })}
-            ${RANGE_HINT}
-            <div><button class="btn btn-primary" type="submit">Save this week</button></div>
-          </form>
-        </section>`,
-    }, status);
-  }
-
-  const weekParam = (q) => weekStart(isDate(q) ? q : localDate());
-
-  app.get('/admin/roster', (c) => rosterPage(c, weekParam(c.req.query('week'))));
-
-  app.post('/admin/roster', async (c) => {
-    const db = c.get('db');
-    const b = await form(c);
-    const week = weekParam(b.week);
-    const days = Array.from({ length: 7 }, (_, i) => addDays(week, i));
-    const usual = await usualHours(db);
-    const stmts = [];
-    for (const w of await activeWorkers(db)) {
-      for (const d of days) {
-        const field = `r_${w.id}_${d}`;
-        if (!(field in b)) continue; // not on the form (added since it was opened)
-        const parsed = parseRanges(b[field]);
-        if (parsed.error) return rosterPage(c, week, { error: `${w.name}, ${dayHead(d)}: ${parsed.error}`, values: b }, 400);
-        stmts.push(['DELETE FROM roster WHERE user_id = ? AND work_date = ?', w.id, d]);
-        // Same as the usual hours: no change stored, so later edits to the usual hours apply.
-        if (formatRanges(parsed.ranges) === formatRanges(usual(w.id, weekdayIndex(d)))) continue;
-        const ranges = parsed.ranges.length ? parsed.ranges : [{ start: OFF, end: OFF }];
-        for (const r of ranges) {
-          stmts.push(['INSERT INTO roster (user_id, work_date, start_time, end_time) VALUES (?, ?, ?, ?)', w.id, d, r.start, r.end]);
-        }
-      }
-    }
-    await db.batch(stmts);
-    return c.redirect(withMsg(`/admin/roster?week=${week}`, 'Roster saved.'));
-  });
-
-  // ---------- Attendance: late arrivals, early leaves, no-shows ----------
+  // ---------- Attendance: late arrivals, early leaves, extra days off ----------
   const fmtMins = (m) => (m == null ? '' : m >= 60 ? formatDuration(m * 60000) : `${m} min`);
-  const INCIDENT = { late: 'Late', early: 'Left early', absent: 'No-show' };
+  const INCIDENT = { late: 'Late', early: 'Left early', missed: 'Missed shift', extra_off: 'Extra day off' };
 
   async function attendanceData(c) {
     const db = c.get('db');
     const ym = monthParam(c.req.query('month'));
     const uid = Number(c.req.query('user')) || null;
-    const graceMin = Number((await getSettings(db)).late_grace_min) || 0;
-    return { ym, uid, graceMin, ...(await attendanceReport(db, ym, { graceMin, userId: uid })) };
+    const settings = await getSettings(db);
+    return { ym, uid, settings, ...(await attendanceReport(db, ym, settings, { userId: uid })) };
   }
 
   app.get('/admin/attendance', async (c) => {
-    const { ym, uid, graceMin, rows, incidents, totals } = await attendanceData(c);
-    const q = (extra) => `/admin/attendance?month=${extra.month ?? ym}${(extra.user ?? uid) ? `&user=${extra.user ?? uid}` : ''}`;
+    const { ym, uid, settings, rows, incidents, totals } = await attendanceData(c);
+    const q = (month) => `/admin/attendance?month=${month}${uid ? `&user=${uid}` : ''}`;
     const person = uid && rows[0] ? rows[0].worker : null;
+    const grace = Number(settings.late_grace_min) || 0;
+    const allowance = Number(settings.days_off_per_week) || 0;
+    const split = workRanges(null, settings).length > 1 || rows.some((r) => workRanges(r.worker, settings).length > 1);
     return render(c, {
       title: 'Attendance',
       active: 'attendance',
@@ -996,16 +848,17 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <div class="row-between page-head">
           <h1>Attendance${person ? html` <span class="muted">· ${person.name}</span>` : ''}</h1>
           <div class="month-nav">
-            <a class="btn btn-small" href="${q({ month: addMonths(ym, -1) })}">‹</a>
+            <a class="btn btn-small" href="${q(addMonths(ym, -1))}">‹</a>
             <strong>${prettyMonth(ym)}</strong>
-            <a class="btn btn-small" href="${q({ month: addMonths(ym, 1) })}">›</a>
+            <a class="btn btn-small" href="${q(addMonths(ym, 1))}">›</a>
           </div>
         </div>
+        ${settings.attendance_mode !== 'on' ? html`<div class="alert alert-warn">The attendance record is off. Turn it on and set the working hours in <a href="/admin/settings">Settings</a>.</div>` : ''}
         <div class="stats">
           <div class="stat stat-amber"><span class="stat-num">${totals.late}</span><span class="stat-label">Late arrivals${totals.lateMin ? html` · ${fmtMins(totals.lateMin)}` : ''}</span></div>
           <div class="stat stat-amber"><span class="stat-num">${totals.early}</span><span class="stat-label">Early leaves${totals.earlyMin ? html` · ${fmtMins(totals.earlyMin)}` : ''}</span></div>
-          <div class="stat stat-grey"><span class="stat-num">${totals.absent}</span><span class="stat-label">No-shows</span></div>
-          <div class="stat stat-green"><span class="stat-num">${totals.attended}/${totals.rostered}</span><span class="stat-label">Rostered shifts attended</span></div>
+          <div class="stat stat-grey"><span class="stat-num">${totals.extraOff}</span><span class="stat-label">Extra days off</span></div>
+          <div class="stat stat-green"><span class="stat-num">${totals.worked}</span><span class="stat-label">Days worked</span></div>
         </div>
 
         <section class="card">
@@ -1015,23 +868,25 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Name</th><th class="num">Rostered</th><th class="num">Attended</th><th class="num">Late</th><th class="num">Mins late</th><th class="num">Left early</th><th class="num">Mins early</th><th class="num">No-shows</th></tr></thead>
+              <thead><tr><th>Name</th><th>Hours</th><th class="num">Days worked</th><th class="num">Days off</th><th class="num">Extra days off</th><th class="num">Late</th><th class="num">Mins late</th><th class="num">Left early</th><th class="num">Mins early</th>${split ? html`<th class="num">Missed shifts</th>` : ''}</tr></thead>
               <tbody>
                 ${rows.map((r) => html`
                   <tr>
                     <td><a href="/admin/attendance?month=${ym}&user=${r.worker.id}">${r.worker.name}</a></td>
-                    <td class="num">${r.rostered}</td><td class="num">${r.attended}</td>
+                    <td class="muted small">${formatRanges(workRanges(r.worker, settings))}</td>
+                    <td class="num">${r.worked}</td><td class="num">${r.off}</td>
+                    <td class="num">${r.extraOff ? html`<strong class="flag">${r.extraOff}</strong>` : '—'}</td>
                     <td class="num">${r.late ? html`<strong>${r.late}</strong>` : '—'}</td><td class="num">${r.lateMin ? fmtMins(r.lateMin) : '—'}</td>
                     <td class="num">${r.early ? html`<strong>${r.early}</strong>` : '—'}</td><td class="num">${r.earlyMin ? fmtMins(r.earlyMin) : '—'}</td>
-                    <td class="num">${r.absent ? html`<strong>${r.absent}</strong>` : '—'}</td>
+                    ${split ? html`<td class="num">${r.missed || '—'}</td>` : ''}
                   </tr>`)}
               </tbody>
             </table>
           </div>
           ${person ? html`<p><a href="/admin/attendance?month=${ym}">← Everyone</a></p>` : ''}
-          <p class="hint">Late = clocked in more than ${graceMin} min after the rostered start. Left early = clocked out more than ${graceMin} min before the rostered end
-            (change the ${graceMin} min in <a href="/admin/settings">Settings</a>). Clocking out and back in for a break within a shift counts once.
-            No-show = a rostered shift that has ended without any clock-in. Shifts with a missing clock-out are not counted as leaving early.</p>
+          <p class="hint">A day without any clock-in is a day off. Each person may take ${allowance} day${allowance === 1 ? '' : 's'} off per week (Monday to Sunday);
+            more than that counts as an <strong>extra day off</strong>. Late = clocked in more than ${grace} min after the start of their hours; left early = clocked out more than
+            ${grace} min before the end. Clocking out and back in for a break counts once. Change these in <a href="/admin/settings">Settings</a>.</p>
         </section>
 
         <section class="card">
@@ -1039,40 +894,41 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           ${incidents.length ? html`
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Date</th>${person ? '' : html`<th>Name</th>`}<th>What</th><th>Rostered</th><th>Actual</th><th class="num">By</th><th></th></tr></thead>
+                <thead><tr><th>Date</th>${person ? '' : html`<th>Name</th>`}<th>What</th><th>Hours</th><th>Actual</th><th class="num">By</th><th></th></tr></thead>
                 <tbody>
                   ${incidents.map((x) => html`
                     <tr>
                       <td>${prettyDate(x.work_date)}</td>
                       ${person ? '' : html`<td>${x.name}</td>`}
-                      <td><span class="${x.type === 'absent' ? 'badge badge-rejected' : 'flag'}">${INCIDENT[x.type]}</span></td>
-                      <td>${localTime(x.schedStart)}–${localTime(x.schedEnd)}</td>
+                      <td><span class="${x.type === 'extra_off' || x.type === 'missed' ? 'badge badge-rejected' : 'flag'}">${INCIDENT[x.type]}</span></td>
+                      <td>${x.schedStart ? `${localTime(x.schedStart)}–${localTime(x.schedEnd)}` : ''}</td>
                       <td>${x.actual ? `${x.type === 'late' ? 'in' : 'out'} ${localTime(x.actual)}` : html`<span class="muted">no clock-in</span>`}</td>
                       <td class="num">${fmtMins(x.minutes)}</td>
                       <td>${x.shiftId ? html`<a href="/admin/shifts/${x.shiftId}">View</a>` : html`<a class="small" href="/admin/shifts/new?user_id=${x.user_id}&date=${x.work_date}">+ add shift</a>`}</td>
                     </tr>`)}
                 </tbody>
               </table>
-            </div>` : html`<p class="muted">No late arrivals, early leaves or no-shows. 🎉</p>`}
+            </div>` : html`<p class="muted">No late arrivals, early leaves or extra days off. 🎉</p>`}
+          <p class="hint">Forgot to clock in? “+ add shift” records the day as worked.</p>
         </section>`,
     });
   });
 
   app.get('/admin/attendance.csv', async (c) => {
     const { ym, uid, rows, incidents } = await attendanceData(c);
-    const out = [['Date', 'Day', 'Name', 'Short Name', 'What', 'Rostered Start', 'Rostered End', 'Actual Time', 'Minutes', 'Shift ID']];
+    const out = [['Date', 'Day', 'Name', 'Short Name', 'What', 'Start', 'End', 'Actual Time', 'Minutes', 'Shift ID']];
     const short = new Map(rows.map((r) => [r.worker.id, r.worker.short_name || '']));
     for (const x of incidents) {
       out.push([
         x.work_date, new Date(`${x.work_date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' }),
-        x.name, short.get(x.user_id), INCIDENT[x.type], localTime(x.schedStart), localTime(x.schedEnd),
+        x.name, short.get(x.user_id), INCIDENT[x.type], x.schedStart ? localTime(x.schedStart) : '', x.schedEnd ? localTime(x.schedEnd) : '',
         x.actual ? localTime(x.actual) : '', x.minutes ?? '', x.shiftId ?? '',
       ]);
     }
     out.push([]);
-    out.push(['Name', 'Short Name', 'Rostered Shifts', 'Attended', 'Times Late', 'Minutes Late', 'Times Left Early', 'Minutes Early', 'No-shows']);
+    out.push(['Name', 'Short Name', 'Days Worked', 'Days Off', 'Extra Days Off', 'Times Late', 'Minutes Late', 'Times Left Early', 'Minutes Early', 'Missed Shifts']);
     for (const r of rows) {
-      out.push([r.worker.name, r.worker.short_name || '', r.rostered, r.attended, r.late, r.lateMin, r.early, r.earlyMin, r.absent]);
+      out.push([r.worker.name, r.worker.short_name || '', r.worked, r.off, r.extraOff, r.late, r.lateMin, r.early, r.earlyMin, r.missed]);
     }
     return sendCsv(c, `attendance-record-${ym}${uid ? `-${uid}` : ''}.csv`, out);
   });
@@ -1130,21 +986,26 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <textarea name="allowed_ips" rows="2" placeholder="e.g. 203.0.113.25, 198.51.100.0/24">${s.allowed_ips}</textarea>
               <span class="hint">Your current IP address is <strong>${normalizeIp(c.get('ip'))}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
             </label>
-            <h3>Roster and lateness</h3>
-            <label>Compare clock-ins with the roster
-              <select name="schedule_mode">
-                ${opt('schedule_mode', 'off', 'Off — no roster')}
-                ${opt('schedule_mode', 'flag', 'Flag late, too-early and not-rostered clock-ins (recommended)')}
-                ${opt('schedule_mode', 'block', 'Flag lateness; only allow clock-in during rostered shifts')}
+            <h3>Attendance record</h3>
+            <label>Late arrivals, early leaves and days off
+              <select name="attendance_mode">
+                ${opt('attendance_mode', 'off', 'Off')}
+                ${opt('attendance_mode', 'on', 'On — record them against the working hours')}
               </select>
-              <span class="hint">Fill in who works when on the <a href="/admin/roster">Roster</a> page. Late arrivals are always allowed, just flagged.</span>
+              <span class="hint">No roster needed: a day without a clock-in is a day off, and staff can arrange their own days off. See the <a href="/admin/attendance">Attendance</a> page.</span>
             </label>
-            <div class="grid-2">
-              <label>Grace period (minutes before arriving counts as late, or leaving as early)
-                <input type="number" name="late_grace_min" min="0" max="60" value="${s.late_grace_min}">
+            <div class="grid-3">
+              <label>Working hours
+                <input name="work_hours" value="${s.work_hours}" required placeholder="10:00-22:00">
+                <span class="hint">For everyone, e.g. 10:00-22:00, or a split shift 10-14, 17-22. Someone with different hours: set them on their page under People.</span>
               </label>
-              <label>Clock-in opens (minutes before the rostered start)
-                <input type="number" name="early_clockin_min" min="0" max="240" value="${s.early_clockin_min}">
+              <label>Days off allowed per week
+                <input type="number" name="days_off_per_week" min="0" max="6" value="${s.days_off_per_week}">
+                <span class="hint">Monday to Sunday. More than this counts as an extra day off.</span>
+              </label>
+              <label>Grace period (minutes)
+                <input type="number" name="late_grace_min" min="0" max="60" value="${s.late_grace_min}">
+                <span class="hint">Arriving more than this after the start is late; leaving more than this before the end is early.</span>
               </label>
             </div>
             <div><button class="btn btn-primary" type="submit">Save settings</button></div>
@@ -1183,6 +1044,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const b = await form(c);
     const pick = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
     const alertCount = Math.round(Number(b.device_alert_count));
+    const hours = parseRanges(b.work_hours);
     const minutes = (v, max, fallback) => {
       const n = Math.round(Number(v));
       return v !== '' && n >= 0 && n <= max ? n : fallback;
@@ -1194,10 +1056,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),
       setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
       setSettingStmt('selfie_mode', pick(b.selfie_mode, ['off', 'flag', 'block'], 'off')),
-      setSettingStmt('schedule_mode', pick(b.schedule_mode, ['off', 'flag', 'block'], 'off')),
+      setSettingStmt('attendance_mode', pick(b.attendance_mode, ['off', 'on'], 'off')),
       setSettingStmt('late_grace_min', minutes(b.late_grace_min, 60, 5)),
-      setSettingStmt('early_clockin_min', minutes(b.early_clockin_min, 240, 30)),
+      setSettingStmt('days_off_per_week', minutes(b.days_off_per_week, 6, 1)),
+      ...(hours.ranges?.length ? [setSettingStmt('work_hours', formatRanges(hours.ranges))] : []),
     ]);
+    if (b.work_hours !== undefined && !hours.ranges?.length) {
+      return c.redirect(withMsg('/admin/settings', `Settings saved, but not the working hours: ${hours.error || 'enter them like 10:00-22:00.'}`));
+    }
     return c.redirect(withMsg('/admin/settings', 'Settings saved.'));
   });
 

@@ -43,9 +43,7 @@ export const FLAG_LABELS = {
   'out:shared_device': 'Check-out device also used by another worker',
   'out:device_changed': 'Clocked out on a different device',
   'in:late': 'Late',
-  'in:too_early': 'Clocked in well before rostered start',
-  'in:unscheduled': 'Not on the roster',
-  'out:left_early': 'Left before rostered end',
+  'out:left_early': 'Left early',
   'in:no_selfie': 'No selfie',
   no_checkout: 'Never clocked out',
   manual: 'Added by supervisor',
@@ -94,14 +92,14 @@ export function setAppName(name) {
   APP_NAME = String(name || '').trim().slice(0, 40) || DEFAULT_APP_NAME;
 }
 
-function nav(user, active, { roster = false } = {}) {
+function nav(user, active, { attendance = false } = {}) {
   if (!user) return '';
   const link = (href, label, key) => html`<a href="${href}" class="${active === key ? 'active' : ''}">${label}</a>`;
   const links = user.role === 'supervisor'
     ? [
       link('/admin', 'Dashboard', 'dashboard'),
       link('/admin/pending', 'Approvals', 'pending'),
-      ...(roster ? [link('/admin/attendance', 'Attendance', 'attendance'), link('/admin/roster', 'Roster', 'roster')] : []),
+      ...(attendance ? [link('/admin/attendance', 'Attendance', 'attendance')] : []),
       link('/admin/export', 'Export', 'export'),
       link('/admin/people', 'People', 'people'),
       link('/admin/settings', 'Settings', 'settings'),
@@ -120,7 +118,7 @@ function nav(user, active, { roster = false } = {}) {
     </nav>`;
 }
 
-export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [], roster = false }) {
+export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [], attendance = false }) {
   return html`<!doctype html>
 <html lang="en">
 <head>
@@ -133,7 +131,7 @@ export function layout({ title, user = null, active = '', flash = null, error = 
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
 </head>
 <body>
-  ${nav(user, active, { roster })}
+  ${nav(user, active, { attendance })}
   <main class="container">
     ${flash ? html`<div class="alert alert-ok" role="status">${flash}</div>` : ''}
     ${error ? html`<div class="alert alert-error" role="alert">${error}</div>` : ''}

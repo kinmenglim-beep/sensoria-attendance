@@ -5,12 +5,13 @@ database**. Staff, hours and settings are completely separate. Bug fixes and imp
 share the code.
 
 It's used as an **attendance record**, not for pay: working hours are fixed, and the app records who came in late,
-left early or didn't turn up, so warnings or penalties can be issued separately. Clock times are shown exactly as
-they happened (no rounding).
+left early or took more than their one day off a week, so warnings or penalties can be issued separately. There is
+**no roster to fill in**: staff arrange their own days off among themselves. Clock times are shown exactly as they
+happened (no rounding).
 
 | Need | How |
 |---|---|
-| **Time-sensitive** | Each person's **usual hours**, plus the **Attendance** page: late arrivals, early leaves, no-shows |
+| **Time-sensitive** | Fixed **working hours** in Settings, plus the **Attendance** page: late arrivals, early leaves, extra days off |
 | **Location** | GPS geofence around the restaurant |
 | **Selfie** | Optional selfie at clock-in (ask, or require) |
 | **Only their own phone** | Phone check set to *Only allow the registered phone* |
@@ -39,30 +40,31 @@ If the first deploy fails with a database error, create a D1 database called `re
    - **Phone check**: *Only allow the worker's registered phone*. A worker's first phone is registered automatically,
      so a colleague who signs in as them on their own phone can't clock in for them.
    - **Selfie at clock-in**: *Ask for a selfie; flag if skipped*, or *Selfie required*.
-   - **Roster and lateness**: *Flag late, too-early and not-rostered clock-ins*. Grace period **5** min (arriving at
-     10:06 for 10:00 is late; leaving at 21:54 for 22:00 is early); clock-in opens **30** min before the shift.
+   - **Attendance record**: *On*. **Working hours** e.g. `10:00-22:00` (split shift: `10-14, 17-22`).
+     **Days off allowed per week**: 1. **Grace period**: 5 min (arriving at 10:06 for 10:00 is late; leaving at 21:54
+     for 22:00 is early).
    - **Work sites**: stand in the restaurant, tap **Use my current location**, then **Add site** (radius 100–150 m).
 3. **People**: add each staff member with their name, **phone number**, a **short name** (initials or nickname) and a
-   4-digit **PIN**.
-4. **Roster → Usual hours**: type each person's normal week once (`10-22`, split shift `10-14, 17-22`, late close
-   `18:00-01:00`, blank for their day off). It repeats every week.
-5. **Roster → Week by week**, only when something changes: leave, a swapped day off, extra hours.
+   4-digit **PIN**. Only if someone works different hours (e.g. evenings only), fill in their **Working hours**.
+
+That's all. Nothing needs updating week to week.
 
 ## 3. What staff do
 
 1. Open the link on **their own phone**, sign in with their **short name** and PIN, and allow location.
 2. Each shift: take the selfie (if turned on) and tap **Clock IN**. The app says if they're late.
    Tap **Clock OUT** when they leave.
-3. The home screen shows today's shift and their roster for the week.
+3. The home screen shows their working hours and how many days off they've taken this week (e.g. "1 of 1").
 
 ## What the manager sees
 
-- **Dashboard** (today, live): who is working, who is **late** (and by how much), who **missed** their shift, who is off.
-- **Attendance** (per month): for each person, rostered shifts, attended, **times late / minutes late**, **times left
-  early / minutes early** and **no-shows**, plus every incident with date, rostered time and actual time. Click a
+- **Dashboard** (today, live): who is working, who hasn't come in yet, and a red flag on anyone missing today who
+  **already had their day off this week**.
+- **Attendance** (per month): for each person, days worked, days off, **extra days off**, **times late / minutes late**
+  and **times left early / minutes early**, plus every incident with the date, working hours and actual time. Click a
   name for that person's record, e.g. before a warning. **CSV** downloads it for your records.
-- Flags on each shift: *Late 12 min*, *Left 30 min early*, *Not on the roster*, *No selfie*, location and phone flags.
-- **Shift page**: the selfie, rostered times, map and phone used. If someone forgot to clock in or out, correct the
-  time here; the attendance record uses the corrected time.
+- Flags on each shift: *Late 12 min*, *Left 30 min early*, *No selfie*, location and phone flags.
+- **Shift page**: the selfie, working hours, map and phone used. If someone forgot to clock out, correct the time here;
+  if they forgot to clock in, use **+ add shift** so the day counts as worked. The record uses the corrected times.
 
 The **Approvals** and **Export** (hours and pay) pages are there too but aren't needed for the attendance record.

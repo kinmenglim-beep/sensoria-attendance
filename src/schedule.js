@@ -1,4 +1,4 @@
-// Roster (rostered working hours) and matching clock-ins against it.
+// Working hours and matching clock-ins against them.
 
 import { localToUtcIso, addDays, localDate } from './time.js';
 
@@ -22,7 +22,7 @@ function parseTime(s) {
 }
 
 /**
- * Parse a roster cell such as "10-15", "10:00-15:00, 17:00-22:30" or "6pm-1am".
+ * Parse working hours such as "10-15", "10:00-15:00, 17:00-22:30" or "6pm-1am".
  * Blank, "off" or "-" means not working. Returns { ranges: [{ start, end }] } or { error }.
  */
 export function parseRanges(text) {
@@ -43,7 +43,7 @@ export function parseRanges(text) {
 
 export const formatRanges = (rows) => rows.map((r) => `${r.start_time ?? r.start}-${r.end_time ?? r.end}`).join(', ');
 
-/** UTC instants of a rostered shift; an end at or before the start is on the next day. */
+/** UTC instants of a block of working hours; an end at or before the start is on the next day. */
 export function slotTimes(date, start, end) {
   const startIso = localToUtcIso(date, start);
   const endIso = localToUtcIso(end <= start ? addDays(date, 1) : date, end);
@@ -57,56 +57,22 @@ export function weekStart(date) {
   return addDays(date, -((dow + 6) % 7));
 }
 
-// A roster row with this start_time means "off that day", overriding the usual hours.
-export const OFF = 'off';
+/** The person's own working hours if set, otherwise everyone's (Settings), as [{ start, end }]. */
+export function workRanges(user, settings) {
+  return parseRanges(user?.work_hours || settings.work_hours).ranges || [];
+}
 
-/** 0 = Monday … 6 = Sunday. */
-export function weekdayIndex(date) {
-  const [y, m, d] = date.split('-').map(Number);
-  return (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+/** That day's working-hour blocks with UTC start/end (a block past midnight ends the next day). */
+export function daySlots(ranges, date) {
+  return ranges.map((r) => ({ work_date: date, start_time: r.start, end_time: r.end, ...slotTimes(date, r.start, r.end) }));
 }
 
 /**
- * Who works when between two dates (inclusive): roster rows for a specific date win,
- * otherwise each active worker's usual weekly hours apply. Optionally for one worker.
- * Returns [{ user_id, work_date, start_time, end_time, override }] sorted by date and start.
- */
-export async function effectiveRoster(db, fromDate, toDate, userId = null) {
-  const only = userId ? ' AND user_id = ?' : '';
-  const params = userId ? [userId] : [];
-  const specific = await db.all(
-    `SELECT user_id, work_date, start_time, end_time FROM roster WHERE work_date BETWEEN ? AND ?${only}`,
-    fromDate, toDate, ...params,
-  );
-  const usual = await db.all(`
-    SELECT h.user_id, h.weekday, h.start_time, h.end_time FROM usual_hours h JOIN users u ON u.id = h.user_id
-    WHERE u.active = 1 AND u.role = 'worker'${only.replace('user_id', 'h.user_id')}
-  `, ...params);
-  const overridden = new Set(specific.map((r) => `${r.user_id}|${r.work_date}`));
-  const out = specific.filter((r) => r.start_time !== OFF).map((r) => ({ ...r, override: true }));
-  for (let d = fromDate; d <= toDate; d = addDays(d, 1)) {
-    const wd = weekdayIndex(d);
-    for (const u of usual) {
-      if (u.weekday === wd && !overridden.has(`${u.user_id}|${d}`)) {
-        out.push({ user_id: u.user_id, work_date: d, start_time: u.start_time, end_time: u.end_time, override: false });
-      }
-    }
-  }
-  return out.sort((a, b) => a.work_date.localeCompare(b.work_date) || a.start_time.localeCompare(b.start_time));
-}
-
-/** One worker's rostered shifts between two dates (inclusive), with UTC start/end. */
-export async function rosterSlots(db, userId, fromDate, toDate) {
-  const rows = await effectiveRoster(db, fromDate, toDate, userId);
-  return rows.map((r) => ({ ...r, ...slotTimes(r.work_date, r.start_time, r.end_time) }));
-}
-
-/**
- * Match a clock-in at `nowMs` to the worker's roster.
+ * Match a clock-in at `nowMs` to a block of working hours.
  * Returns one of:
- *   { status: 'ok' | 'late', slot, lateMin }   rostered shift found (late = past the grace period)
- *   { status: 'too_early', slot, opensAt }      next rostered shift hasn't opened for clock-in yet
- *   { status: 'none' }                          nothing rostered for the rest of today
+ *   { status: 'ok' | 'late', slot, lateMin }   block found (late = past the grace period)
+ *   { status: 'too_early', slot, opensAt }      more than earlyMin before the next block
+ *   { status: 'none' }                          no more working hours today
  */
 export function matchSlot(slots, nowMs, { earlyMin, graceMin }) {
   const open = slots.find((s) => nowMs >= Date.parse(s.startIso) - earlyMin * 60000 && nowMs <= Date.parse(s.endIso));
@@ -119,13 +85,13 @@ export function matchSlot(slots, nowMs, { earlyMin, graceMin }) {
   return { status: 'none' };
 }
 
-/** Whole minutes between the rostered start and the check-in (0 if on time or early). */
+/** Whole minutes between the start of working hours and the check-in (0 if on time or early). */
 export function minutesLate(shift) {
   if (!shift.sched_start) return 0;
   return Math.max(0, Math.floor((Date.parse(shift.check_in_at) - Date.parse(shift.sched_start)) / 60000));
 }
 
-/** Whole minutes between the check-out and the rostered end (0 if they stayed until the end). */
+/** Whole minutes between the check-out and the end of working hours (0 if they stayed until the end). */
 export function minutesEarly(shift) {
   if (!shift.sched_end || !shift.check_out_at) return 0;
   return Math.max(0, Math.floor((Date.parse(shift.sched_end) - Date.parse(shift.check_out_at)) / 60000));

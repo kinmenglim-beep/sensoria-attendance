@@ -53,6 +53,10 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       offThisWeek = daysOff(worked, week, over ? today : addDays(today, -1), created).length;
     }
     const allowance = Number(s.days_off_per_week) || 0;
+    // Outlets with their own hours (unless the person has their own): show each outlet's.
+    const outletHours = tracking && !user.work_hours
+      ? await db.all("SELECT DISTINCT name, work_hours FROM sites WHERE work_hours IS NOT NULL AND work_hours <> '' ORDER BY name") : [];
+    const fmt = (ranges) => ranges.map((r) => `${r.start}–${r.end}`).join(', ');
     const askSelfie = !open && s.selfie_mode !== 'off';
 
     return render(c, {
@@ -69,7 +73,8 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                      · <span data-elapsed-since="${open.check_in_at}">${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></p>`
             : html`<h1 class="clock-status">You're not clocked in</h1>
                    <p class="clock-since" data-clock="${TZ}"></p>`}
-          ${tracking && hours.length ? html`<p class="roster-today">Working hours: <strong>${hours.map((r) => `${r.start}–${r.end}`).join(', ')}</strong></p>
+          ${tracking && hours.length ? html`<p class="roster-today">Working hours: <strong>${fmt(hours)}</strong>${outletHours.length
+              ? html`${outletHours.map((o) => html`<br>${o.name}: <strong>${fmt(workRanges(null, s, o))}</strong>`)}` : ''}</p>
             <p class="roster-today ${offThisWeek > allowance ? 'flag' : 'muted'}">Days off this week: ${offThisWeek} of ${allowance}</p>` : ''}
 
           <form id="clock-form" class="stack" data-action="${action}" data-location="${s.geofence_mode}" data-selfie="${askSelfie ? s.selfie_mode : 'off'}">
@@ -134,6 +139,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       }
     }
     const loc = { lat: null, lng: null, accuracy: null, site: null, distance: null };
+    let siteRow = null; // the nearest outlet, for its working hours
 
     // 1. GPS geofence
     if (s.geofence_mode !== 'off') {
@@ -149,6 +155,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         const geo = checkGeofence(lat, lng, loc.accuracy, await db.all('SELECT * FROM sites'));
         if (geo) {
           loc.site = geo.site.name;
+          siteRow = geo.site;
           loc.distance = geo.distance;
           if (!geo.inside) {
             if (s.geofence_mode === 'block') {
@@ -174,7 +181,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     const backFromBreak = [];
     if (action === 'in' && s.attendance_mode === 'on') {
       const today = localDate();
-      const hours = workRanges(c.get('user'), s);
+      const hours = workRanges(c.get('user'), s, siteRow);
       const slots = [...daySlots(hours, addDays(today, -1)), ...daySlots(hours, today)];
       // Anything from 3 hours before the start counts as clocking in for that block.
       const m = matchSlot(slots, Date.now(), { earlyMin: 180, graceMin: Number(s.late_grace_min) || 0 });
@@ -249,7 +256,8 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         // Device flags are for supervisors only, so only location/network issues are mentioned here.
         const reviewNeeded = flags.some((f) => /no_location|outside_area|off_network/.test(f));
         const timing = lateMin ? ` You're ${lateMin} min late.` : '';
-        return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked in at ${localTime(now)}.${timing}${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
+        const at = loc.site && !flags.includes('in:outside_area') ? ` at ${loc.site}` : '';
+        return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked in${at} at ${localTime(now)}.${timing}${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
       }
 
       const workerNote = [open.worker_note, note].filter(Boolean).join(' / ') || null;

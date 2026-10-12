@@ -136,6 +136,15 @@ last clock-out, so clocking out and in for a break counts once. Times corrected 
 forgotten clock-in can be added as a manual shift so the day counts as worked. A shift with a missing clock-out isn't
 counted as leaving early. Pay and the monthly export are not affected.
 
+### Several outlets
+
+Add each outlet as a **work site** in Settings (e.g. "PJ" and "KL"). Staff aren't tied to one outlet: each clock-in is
+filed under the nearest outlet by GPS. With two or more outlets, the **Dashboard**, **Attendance** and **Export** pages
+get an *All outlets | PJ | KL* switch, and every CSV can be downloaded for one outlet or all of them. An outlet can have
+its own working hours (Settings → Work sites); a person's own hours still come first. Days off and extra days off are
+about the person, so they are shown under *All outlets*. GPS must be on (Settings → GPS location) for outlets to be
+recorded; a shift added by hand lets you pick the outlet.
+
 ### Short names
 
 Each person can have an optional **short name** (2–12 letters or digits, e.g. initials `KML`) on the People page.

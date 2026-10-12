@@ -57,9 +57,12 @@ export function weekStart(date) {
   return addDays(date, -((dow + 6) % 7));
 }
 
-/** The person's own working hours if set, otherwise everyone's (Settings), as [{ start, end }]. */
-export function workRanges(user, settings) {
-  return parseRanges(user?.work_hours || settings.work_hours).ranges || [];
+/**
+ * Working hours as [{ start, end }]: the person's own if set, otherwise the outlet's
+ * (when known and set), otherwise everyone's (Settings).
+ */
+export function workRanges(user, settings, site = null) {
+  return parseRanges(user?.work_hours || site?.work_hours || settings.work_hours).ranges || [];
 }
 
 /** That day's working-hour blocks with UTC start/end (a block past midnight ends the next day). */

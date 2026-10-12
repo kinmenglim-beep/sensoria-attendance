@@ -6,9 +6,10 @@ export const round2 = (n) => Math.round(n * 100) / 100;
 /**
  * Monthly roll-up per worker. Only approved hours count towards pay;
  * pending / rejected / still-open shifts are reported separately so
- * management can see what is outstanding.
+ * management can see what is outstanding. With `outlet`, only shifts clocked in
+ * at that outlet (work site), and only the people who worked there.
  */
-export async function monthReport(db, ym) {
+export async function monthReport(db, ym, { outlet = null } = {}) {
   const like = `${ym}-%`;
   const nDays = daysInMonth(ym);
 
@@ -18,15 +19,21 @@ export async function monthReport(db, ym) {
     JOIN users u ON u.id = s.user_id
     LEFT JOIN users r ON r.id = s.reviewed_by
     ${DEVICE_JOINS}
-    WHERE s.work_date LIKE ?
+    WHERE s.work_date LIKE ?${outlet ? ' AND s.in_site = ?' : ''}
     ORDER BY u.name COLLATE NOCASE, s.check_in_at
-  `, like);
+  `, like, ...(outlet ? [outlet] : []));
 
-  const workers = await db.all(`
-    SELECT id, name, login, hourly_rate FROM users
-    WHERE (role = 'worker' AND active = 1) OR id IN (SELECT user_id FROM shifts WHERE work_date LIKE ?)
-    ORDER BY name COLLATE NOCASE
-  `, like);
+  const workers = outlet
+    ? await db.all(`
+      SELECT id, name, login, hourly_rate FROM users
+      WHERE id IN (SELECT user_id FROM shifts WHERE work_date LIKE ? AND in_site = ?)
+      ORDER BY name COLLATE NOCASE
+    `, like, outlet)
+    : await db.all(`
+      SELECT id, name, login, hourly_rate FROM users
+      WHERE (role = 'worker' AND active = 1) OR id IN (SELECT user_id FROM shifts WHERE work_date LIKE ?)
+      ORDER BY name COLLATE NOCASE
+    `, like);
 
   const byId = new Map();
   for (const w of workers) {

@@ -22,9 +22,11 @@ const dayOver = (slots, now) => !slots.length || Date.parse(slots[slots.length -
 /**
  * @returns {{ rows, incidents, totals }}
  *   rows:      per worker { worker, worked, off, extraOff, late, lateMin, early, earlyMin, missed }
- *   incidents: [{ type: 'late'|'early'|'missed'|'extra_off', user_id, name, work_date, schedStart, schedEnd, actual, minutes, shiftId }]
+ *   incidents: [{ type: 'late'|'early'|'missed'|'extra_off', user_id, name, work_date, outlet, schedStart, schedEnd, actual, minutes, shiftId }]
+ * With `outlet`, only what happened at that outlet (where people clocked in); days off are
+ * about the person, not an outlet, so they are left out.
  */
-export async function attendanceReport(db, ym, settings, { userId = null } = {}) {
+export async function attendanceReport(db, ym, settings, { userId = null, outlet = null } = {}) {
   const from = `${ym}-01`;
   const last = `${ym}-${String(daysInMonth(ym)).padStart(2, '0')}`;
   const today = localDate();
@@ -45,23 +47,24 @@ export async function attendanceReport(db, ym, settings, { userId = null } = {})
   // Whole weeks, so a day off at the end of last month counts towards this month's first week.
   const weekFrom = weekStart(from);
   const shifts = await db.all(`
-    SELECT id, user_id, work_date, check_in_at, check_out_at, sched_start, sched_end, flags FROM shifts
+    SELECT id, user_id, work_date, check_in_at, check_out_at, sched_start, sched_end, flags, in_site FROM shifts
     WHERE work_date BETWEEN ? AND ? ORDER BY check_in_at
   `, addDays(weekFrom, -1), to);
   const inMonth = (d) => d >= from && d <= to;
+  const sites = new Map((await db.all('SELECT name, work_hours FROM sites')).map((x) => [x.name, x]));
 
   for (const row of rows) {
     const w = row.worker;
     const mine = shifts.filter((s) => s.user_id === w.id);
     const worked = new Set(mine.map((s) => s.work_date));
     const ranges = workRanges(w, settings);
-    const add = (type, date, sched, actual, minutes, shiftId) => incidents.push({
-      type, user_id: w.id, name: w.name, work_date: date,
+    const add = (type, date, sched, actual, minutes, shiftId, at = null) => incidents.push({
+      type, user_id: w.id, name: w.name, work_date: date, outlet: at,
       schedStart: sched?.startIso ?? null, schedEnd: sched?.endIso ?? null, actual, minutes, shiftId,
     });
 
     // Days off, week by week; the ones beyond the allowance are extra days off.
-    for (let wk = weekFrom; wk <= to; wk = addDays(wk, 7)) {
+    for (let wk = weekFrom; !outlet && wk <= to; wk = addDays(wk, 7)) {
       const end = addDays(wk, 6) < to ? addDays(wk, 6) : to;
       const offs = daysOff(worked, wk, end, w.created_at)
         .filter((d) => dayOver(daySlots(ranges, d), now));
@@ -77,13 +80,19 @@ export async function attendanceReport(db, ym, settings, { userId = null } = {})
 
     // Days worked: late arrival, early leave, and any block of a split shift missed entirely.
     for (const d of [...worked].filter(inMonth).sort()) {
+      const dayShifts = mine.filter((s) => s.work_date === d);
+      if (outlet && !dayShifts.some((s) => s.in_site === outlet)) continue;
       row.worked += 1;
-      for (const slot of daySlots(ranges, d)) {
+      // The outlet they clocked in at that day decides the working hours, if it has its own.
+      const dayOutlet = dayShifts[0].in_site;
+      for (const slot of daySlots(workRanges(w, settings, sites.get(dayOutlet)), d)) {
         const during = mine.filter((s) => s.check_in_at < slot.endIso && (s.check_out_at || new Date(now).toISOString()) > slot.startIso);
+        const at = during[0]?.in_site ?? dayOutlet;
+        if (outlet && at !== outlet) continue;
         if (!during.length) {
           if (Date.parse(slot.endIso) <= now) {
             row.missed += 1;
-            add('missed', d, slot, null, null, null);
+            add('missed', d, slot, null, null, null, at);
           }
           continue;
         }
@@ -98,7 +107,7 @@ export async function attendanceReport(db, ym, settings, { userId = null } = {})
           const minutes = Math.floor(lateMs / 60000);
           row.late += 1;
           row.lateMin += minutes;
-          add('late', d, slot, first.check_in_at, minutes, first.id);
+          add('late', d, slot, first.check_in_at, minutes, first.id, at);
         }
         // Early leave only once they've clocked out for good (nothing open or forgotten).
         const lastShift = during[during.length - 1];
@@ -109,7 +118,7 @@ export async function attendanceReport(db, ym, settings, { userId = null } = {})
             const minutes = Math.floor(earlyMs / 60000);
             row.early += 1;
             row.earlyMin += minutes;
-            add('early', d, slot, lastShift.check_out_at, minutes, lastShift.id);
+            add('early', d, slot, lastShift.check_out_at, minutes, lastShift.id, at);
           }
         }
       }
@@ -118,7 +127,8 @@ export async function attendanceReport(db, ym, settings, { userId = null } = {})
 
   incidents.sort((a, b) => a.work_date.localeCompare(b.work_date) || a.name.localeCompare(b.name)
     || String(a.schedStart).localeCompare(String(b.schedStart)));
-  return { rows, incidents, totals: totalsOf(rows) };
+  const shown = outlet ? rows.filter((r) => r.worked) : rows;
+  return { rows: shown, incidents, totals: totalsOf(shown) };
 }
 
 function totalsOf(rows) {

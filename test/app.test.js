@@ -434,7 +434,7 @@ test('attendance record: days off, extra days off, late and early', async () => 
   assert.match(r.text, /Extra day off/);
   assert.match(r.text, /in 10:12/);
   r = await sup('GET', `/admin/attendance.csv?month=${day(6).slice(0, 7)}`);
-  assert.match(r.text, new RegExp(`${day(6)},Sun,Lim Kin Meng,KML,Extra day off,,,,,`));
+  assert.match(r.text, new RegExp(`${day(6)},Sun,Lim Kin Meng,KML,,Extra day off,,,,,`));
   r = await sup('GET', `/admin/attendance?month=${mon.slice(0, 7)}&user=${siti}`);
   assert.match(r.text, /Attendance <span class="muted">· Siti/);
   assert.doesNotMatch(r.text, /Lim Kin Meng/);
@@ -444,6 +444,74 @@ test('attendance record: days off, extra days off, late and early', async () => 
   assert.equal(r.status, 302);
   const sat = day(5) === mon ? 'Mon' : day(5);
   assert.deepEqual(await weekIncidents(), ['Lim Kin Meng|Mon|late|12', 'Lim Kin Meng|Tue|early|30', `Lim Kin Meng|${sat}|late|30`]);
+});
+
+test('outlets: clock-ins are filed under the nearest outlet and each can be viewed separately', async () => {
+  const { localTime } = await import('../src/time.js');
+  const at = (mins) => localTime(new Date(Date.now() + mins * 60000));
+  // Everyone's hours started 30 min ago; KL's own hours start in 10 min.
+  const { sup, db, client, uid } = await restaurant({
+    geofence_mode: 'flag', attendance_mode: 'on', work_hours: `${at(-30)}-${at(240)}`, late_grace_min: '5',
+  });
+  await sup('POST', '/admin/sites', { form: { name: 'PJ', lat: '3.1073', lng: '101.6067', radius_m: '150' } });
+  let r = await sup('POST', '/admin/sites', { form: { name: 'KL', lat: '3.1478', lng: '101.7110', radius_m: '150', work_hours: 'lunch' } });
+  assert.match(decodeURIComponent(r.location), /Could not add site: working hours/);
+  await sup('POST', '/admin/sites', { form: { name: 'KL', lat: '3.1478', lng: '101.7110', radius_m: '150', work_hours: `${at(10)}-${at(300)}` } });
+  await sup('POST', '/admin/people', { form: { name: 'Siti', login: '0198887777', short_name: 'SITI', role: 'worker', secret: '5678' } });
+
+  const lim = client();
+  const siti = client();
+  await lim('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  await siti('POST', '/login', { form: { login: 'SITI', secret: '5678' } });
+  r = await lim('POST', '/api/clock', { json: { action: 'in', lat: 3.1074, lng: 101.6068, accuracy: 10 } });
+  assert.match(JSON.parse(r.text).message, /Clocked in at PJ at .* You're (30|31) min late/);
+  r = await siti('POST', '/api/clock', { json: { action: 'in', lat: 3.1479, lng: 101.7111, accuracy: 10 } });
+  assert.match(JSON.parse(r.text).message, /Clocked in at KL at/);
+  assert.doesNotMatch(JSON.parse(r.text).message, /late/); // KL's own hours haven't started
+  assert.deepEqual((await db.all('SELECT in_site, flags FROM shifts ORDER BY id')).map((x) => `${x.in_site}:${x.flags}`), ['PJ:in:late', 'KL:']);
+
+  // Dashboard: all outlets, then each one.
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /All outlets/);
+  assert.match(r.text, /<th>Outlet<\/th>/);
+  r = await sup('GET', '/admin?outlet=PJ');
+  assert.match(r.text, /Check-ins today at PJ/);
+  assert.match(r.text, /Lim Kin Meng/);
+  assert.doesNotMatch(r.text, /Siti/);
+  r = await sup('GET', '/admin?outlet=Nowhere'); // unknown outlet: everything
+  assert.match(r.text, /Siti/);
+
+  // Attendance per outlet.
+  await lim('POST', '/api/clock', { json: { action: 'out', lat: 3.1074, lng: 101.6068 } });
+  const ym = localDate().slice(0, 7);
+  r = await sup('GET', `/admin/attendance?month=${ym}&outlet=PJ`);
+  assert.match(r.text, /Attendance <span class="muted">· PJ/);
+  assert.match(r.text, /Lim Kin Meng/);
+  assert.doesNotMatch(r.text, /Siti/);
+  r = await sup('GET', `/admin/attendance.csv?month=${ym}`);
+  assert.match(r.text, /Lim Kin Meng,KML,PJ,Late,/);
+  r = await sup('GET', `/admin/attendance.csv?month=${ym}&outlet=KL`);
+  assert.match(r.headers.get('content-disposition'), /attendance-record-\d{4}-\d{2}-KL\.csv/);
+  assert.doesNotMatch(r.text, /Lim Kin Meng,KML,PJ/);
+
+  // Pay export per outlet.
+  r = await sup('GET', `/admin/export/summary.csv?month=${ym}&outlet=KL`);
+  assert.match(r.text, /Siti/);
+  assert.doesNotMatch(r.text, /Lim Kin Meng/);
+  r = await sup('GET', `/admin/export?month=${ym}&outlet=PJ`);
+  assert.match(r.text, /summary\.csv\?month=\d{4}-\d{2}&amp;outlet=PJ/);
+
+  // A shift added by hand is filed under the chosen outlet and uses its hours.
+  const { addDays } = await import('../src/time.js');
+  const yesterday = addDays(localDate(), -1);
+  r = await sup('POST', '/admin/shifts/new', { form: { user_id: String(uid), outlet: 'KL', work_date: yesterday, in_time: '12:00', out_time: '13:00' } });
+  assert.equal(r.status, 302);
+  assert.equal((await db.get('SELECT in_site FROM shifts ORDER BY id DESC LIMIT 1')).in_site, 'KL');
+
+  // Outlet hours can be changed or cleared.
+  const kl = await db.get("SELECT id FROM sites WHERE name = 'KL'");
+  await sup('POST', `/admin/sites/${kl.id}/hours`, { form: { work_hours: '' } });
+  assert.equal((await db.get('SELECT work_hours FROM sites WHERE id = ?', kl.id)).work_hours, null);
 });
 
 test('selfie: required, stored with the shift and shown to supervisors only', async () => {

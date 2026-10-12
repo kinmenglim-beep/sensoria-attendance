@@ -52,6 +52,14 @@ If the first deploy fails with a database error, create a D1 database called `os
 
 That's all. Nothing needs updating week to week.
 
+## More than one outlet
+
+Add each outlet under **Settings → Work sites** (stand inside it, tap **Use my current location**, name it e.g. `PJ`,
+then do the same at `KL`). Same app, same staff, same login. Staff clock in wherever they are working that day and the
+shift is filed under that outlet. The Dashboard, Attendance and Export pages then have an *All outlets | PJ | KL*
+switch, and the CSVs can be downloaded per outlet. If an outlet keeps different hours, type them next to it under
+Work sites.
+
 ## 3. What staff do
 
 1. Open the link on **their own phone**, sign in with their **short name** and PIN, and allow location.

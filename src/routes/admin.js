@@ -1,5 +1,5 @@
 import {
-  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag,
+  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag, PHOTO_KEEP_DAYS,
 } from '../db.js';
 import { hashSecret } from '../auth.js';
 import {
@@ -7,12 +7,16 @@ import {
   prettyDate, prettyMonth, isDate, isMonth, isTime, TZ,
 } from '../time.js';
 import { normalizeIp } from '../verify.js';
-import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime, FLAG_LABELS } from '../views.js';
+import { html, statusBadge, flagList, flagLabel, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { monthReport } from '../report.js';
 import { toCsv } from '../csv.js';
 import {
   deviceName, frequentDeviceChangers, recentDeviceCount, DEVICE_COLUMNS, DEVICE_JOINS,
 } from '../device.js';
+import {
+  parseRanges, formatRanges, weekStart, workRanges, daySlots, minutesLate, minutesEarly,
+} from '../schedule.js';
+import { attendanceReport, daysOff } from '../attendance.js';
 
 const toIds = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
   .map(Number).filter((n) => Number.isInteger(n) && n > 0);
@@ -43,7 +47,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   const shiftHours = (s) => (s.check_out_at ? paidHours(s.check_in_at, s.check_out_at) : null);
   // Auto-closed shifts need a real check-out time before they can be approved.
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
-  const activeWorkers = (db) => db.all("SELECT id, name FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
+  const activeWorkers = (db) => db.all("SELECT id, name, work_hours, created_at FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
 
   /** Table of shifts with optional checkboxes for bulk approval. */
   function shiftTable(shifts, { showDate = false, back = '/admin' } = {}) {
@@ -69,7 +73,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
                   <td>${clockTime(s.check_in_at)}</td>
                   <td>${s.check_out_at ? clockTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
-                  <td>${flagList(s.flags) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
+                  <td>${flagList(s.flags, { lateMin: minutesLate(s), earlyMin: minutesEarly(s) }) || html`<span class="ok-check" title="All checks passed">✓</span>`}</td>
                   <td>${statusBadge(s)}${s.reviewer_name ? html`<div class="muted small">${s.reviewer_name}</div>` : ''}</td>
                   <td><a href="/admin/shifts/${s.id}">View</a></td>
                 </tr>`)}
@@ -102,6 +106,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       if (!byUser.has(s.user_id)) byUser.set(s.user_id, []);
       byUser.get(s.user_id).push(s);
     }
+    const settings = await getSettings(db);
+    const tracking = settings.attendance_mode === 'on';
     const working = []; const done = []; const absent = [];
     for (const w of workers) {
       const list = byUser.get(w.id) || [];
@@ -117,7 +123,31 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     `, today);
     const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
     const back = `/admin?date=${date}`;
-    const settings = await getSettings(db);
+    const graceMs = (Number(settings.late_grace_min) || 0) * 60000;
+    const allowance = Number(settings.days_off_per_week) || 0;
+    // Days off each absent person already took earlier this week.
+    const week = weekStart(date);
+    const workedThisWeek = new Set(tracking ? (await db.all('SELECT DISTINCT user_id, work_date FROM shifts WHERE work_date BETWEEN ? AND ?', week, date))
+      .map((r) => `${r.user_id}|${r.work_date}`) : []);
+    const offBefore = (w) => (date > week
+      ? daysOff(new Set([...workedThisWeek].filter((k) => k.startsWith(`${w.id}|`)).map((k) => k.split('|')[1])), week, addDays(date, -1), w.created_at).length
+      : 0);
+    /**
+     * For someone not clocked in: "starts 10:00", "not in yet" (may be their day off), "day off",
+     * flagged when they already had their days off this week.
+     */
+    const dueLabel = (w) => {
+      if (!tracking) return '';
+      const slots = daySlots(workRanges(w, settings), date);
+      if (!slots.length) return '';
+      const prev = offBefore(w);
+      const extra = prev >= allowance;
+      const already = extra && prev ? html` <span class="flag">already ${prev} day${prev === 1 ? '' : 's'} off this week</span>` : '';
+      const current = slots.find((x) => Date.now() <= Date.parse(x.endIso));
+      if (!current) return extra ? html`<span class="flag">extra day off</span>${already}` : html`<span class="muted small">day off</span>`;
+      if (Date.now() - Date.parse(current.startIso) > graceMs) return html`<span class="muted small">not in yet</span>${already}`;
+      return html`<span class="muted small">starts ${localTime(current.startIso)}</span>${already}`;
+    };
     const alertCount = Number(settings.device_alert_count) || 0;
     const deviceChangers = alertCount >= 2 ? await frequentDeviceChangers(db, alertCount) : [];
     const phonesToReview = settings.device_mode === 'off' ? [] : await db.all(`
@@ -177,7 +207,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <div class="card">
             <h2>Not clocked in <span class="count">${absent.length}</span></h2>
             ${absent.length ? html`<ul class="people-list">
-              ${absent.map((w) => html`<li><span>${w.name}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
+              ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
             </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
           </div>
           <div class="card">
@@ -355,10 +385,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const approve = b.approve === '1';
     const userId = c.get('user').id;
     const now = new Date().toISOString();
+    // Link it to the working hours it overlaps, like a normal clock-in.
+    const hours = workRanges(await db.get('SELECT work_hours FROM users WHERE id = ?', worker.id), await getSettings(db));
+    const slot = [...daySlots(hours, addDays(t.date, -1)), ...daySlots(hours, t.date)].find((x) => t.inIso < x.endIso && t.outIso > x.startIso);
     const { lastId: id } = await db.run(`
-      INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, flags, status, reviewed_by, reviewed_at)
-      VALUES (?, ?, ?, ?, 'manual', ?, ?, ?)
-    `, worker.id, t.date, t.inIso, t.outIso, approve ? 'approved' : 'pending', approve ? userId : null, approve ? now : null);
+      INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, sched_start, sched_end, flags, status, reviewed_by, reviewed_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)
+    `, worker.id, t.date, t.inIso, t.outIso, slot?.startIso ?? null, slot?.endIso ?? null,
+    approve ? 'approved' : 'pending', approve ? userId : null, approve ? now : null);
     await db.batch([
       auditStmt(id, userId, 'manual_add', String(b.reason || '').slice(0, 300) || null),
       ...(approve ? [auditStmt(id, userId, 'approve')] : []),
@@ -389,6 +423,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const inDevice = await deviceDetail(db, shift.in_device_id, shift.in_device_label, shift.in_device_key, shift.user_id);
     const outDevice = await deviceDetail(db, shift.out_device_id, shift.out_device_label, shift.out_device_key, shift.user_id);
     const hrs = shiftHours(shift);
+    const photo = await db.get('SELECT id, taken_at FROM photos WHERE shift_id = ? ORDER BY taken_at DESC LIMIT 1', shift.id);
     const v = values || {
       work_date: shift.work_date,
       in_time: localTime(shift.check_in_at),
@@ -416,7 +451,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               ${shift.review_note ? html`<div class="small">“${shift.review_note}”</div>` : ''}
             </div>
           </div>
-          ${shift.flags ? html`<p>${flagList(shift.flags)}</p>` : ''}
+          ${shift.sched_start ? html`<p><span class="label">Working hours</span> ${localTime(shift.sched_start)}–${localTime(shift.sched_end)}${minutesLate(shift) ? html` · clocked in ${minutesLate(shift)} min after the start` : ''}</p>` : ''}
+          ${shift.flags ? html`<p>${flagList(shift.flags, { lateMin: minutesLate(shift), earlyMin: minutesEarly(shift) })}</p>` : ''}
           ${shift.worker_note ? html`<p><span class="label">Worker note</span> ${shift.worker_note}</p>` : ''}
 
           ${hasFlag(shift.flags, 'no_checkout') ? html`<p class="alert alert-warn">This worker never clocked out. Enter the real check-out time below before approving.</p>` : ''}
@@ -443,6 +479,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <section class="grid-2">
           <div class="card">
             <h2>Check-in verification</h2>
+            ${photo ? html`<p><img class="selfie" src="/admin/photos/${photo.id}" alt="Selfie taken at check-in" loading="lazy"></p>` : ''}
             <p>${locationSummary(shift.in_site, shift.in_distance_m, shift.in_accuracy, shift.in_lat, shift.in_lng)}</p>
             ${inDevice}
             ${shift.in_ip ? html`<p class="muted small">IP ${shift.in_ip}</p>` : ''}
@@ -519,6 +556,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <label>Phone / Staff ID (used to sign in)
           <input name="login" value="${values.login || ''}" required maxlength="50" autocapitalize="none">
         </label>
+        <label>Short name (optional, also used to sign in)
+          <input name="short_name" value="${values.short_name || ''}" maxlength="12" autocapitalize="characters" placeholder="e.g. KML">
+          <span class="hint">Initials or a nickname: 2–12 letters or digits, easier to type than a phone number.</span>
+        </label>
+        <label>Working hours (optional)
+          <input name="work_hours" value="${values.work_hours || ''}" maxlength="40" placeholder="Same as everyone">
+          <span class="hint">Only if this person's hours differ from the usual ones in Settings, e.g. 17:00-23:00.</span>
+        </label>
         <label>Role
           <select name="role" data-role-select>
             <option value="worker" ${values.role !== 'supervisor' ? 'selected' : ''}>Worker</option>
@@ -539,17 +584,36 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const v = {
       name: String(b.name || '').trim(),
       login: String(b.login || '').trim(),
+      short_name: String(b.short_name || '').trim() || null,
+      work_hours: String(b.work_hours || '').trim() || null,
       role: b.role === 'supervisor' ? 'supervisor' : 'worker',
       hourly_rate: b.hourly_rate === '' || b.hourly_rate === undefined ? null : Number(b.hourly_rate),
       secret: String(b.secret || ''),
     };
     if (!v.name || !v.login) return { v, error: 'Name and phone/staff ID are required.' };
     if (v.hourly_rate !== null && !(v.hourly_rate >= 0)) return { v, error: 'Hourly rate must be a positive number.' };
+    if (v.short_name && !/^[A-Za-z0-9]{2,12}$/.test(v.short_name)) return { v, error: 'Short name: 2–12 letters or digits, no spaces.' };
+    if (v.work_hours) {
+      const parsed = parseRanges(v.work_hours);
+      if (parsed.error || !parsed.ranges.length) return { v, error: `Working hours: ${parsed.error || 'enter them like 10:00-22:00, or leave blank.'}` };
+      v.work_hours = formatRanges(parsed.ranges);
+    }
     if (isNew || v.secret) {
       if (v.role === 'supervisor' && v.secret.length < 8) return { v, error: 'Supervisor passwords need at least 8 characters.' };
       if (v.role === 'worker' && v.secret.length < 4) return { v, error: 'Worker PINs need at least 4 characters.' };
     }
     return { v };
+  }
+
+  /** A login name or short name must not match anyone else's, or sign-in would be ambiguous. */
+  async function signInClash(db, v, selfId = 0) {
+    const names = [v.login, v.short_name].filter(Boolean);
+    const marks = names.map(() => '?').join(',');
+    const other = await db.get(
+      `SELECT name FROM users WHERE id <> ? AND (login IN (${marks}) OR short_name IN (${marks})) LIMIT 1`,
+      selfId, ...names, ...names,
+    );
+    return other ? `That phone/staff ID or short name is already used by ${other.name}.` : null;
   }
 
   async function peoplePage(c, { error = null, values = {} } = {}, status = 200) {
@@ -586,7 +650,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <tbody>
                 ${people.map((p) => html`
                   <tr class="${p.active ? '' : 'inactive'}">
-                    <td>${p.name}</td><td>${p.login}</td>
+                    <td>${p.name}</td><td>${p.login}${p.short_name ? html` <span class="muted">· ${p.short_name}</span>` : ''}</td>
                     <td>${p.role === 'supervisor' ? 'Supervisor' : 'Worker'}</td>
                     <td class="num">${p.hourly_rate != null ? fmtMoney(p.hourly_rate) : '—'}</td>
                     <td>${p.last_seen ? localDateTime(p.last_seen) : '—'}</td>
@@ -606,11 +670,13 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   app.post('/admin/people', async (c) => {
     const { v, error } = validatePerson(await form(c), { isNew: true });
     if (error) return peoplePage(c, { error, values: v }, 400);
+    const clash = await signInClash(c.get('db'), v);
+    if (clash) return peoplePage(c, { error: clash, values: v }, 400);
     try {
-      await c.get('db').run('INSERT INTO users (name, login, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?)',
-        v.name, v.login, await hashSecret(v.secret), v.role, v.hourly_rate);
+      await c.get('db').run('INSERT INTO users (name, login, short_name, work_hours, secret_hash, role, hourly_rate) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        v.name, v.login, v.short_name, v.work_hours, await hashSecret(v.secret), v.role, v.hourly_rate);
     } catch (err) {
-      if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return peoplePage(c, { error: 'That phone/staff ID or short name is already in use.', values: v }, 400);
       throw err;
     }
     return c.redirect(withMsg('/admin/people', `${v.name} added.`));
@@ -725,6 +791,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     v.active = b.active === '1' ? 1 : 0;
     const self = person.id === c.get('user').id;
     if (error) return personPage(c, person, { error, values: v }, 400);
+    const clash = await signInClash(db, v, person.id);
+    if (clash) return personPage(c, person, { error: clash, values: v }, 400);
     if (self && (!v.active || v.role !== 'supervisor')) {
       return personPage(c, person, { error: "You can't deactivate yourself or remove your own supervisor role.", values: v }, 400);
     }
@@ -732,18 +800,137 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       && await db.get('SELECT 1 AS x FROM shifts WHERE user_id = ? AND check_out_at IS NULL', person.id)) {
       return personPage(c, person, { error: 'This worker is still clocked in. Close their shift first.', values: v }, 400);
     }
-    const stmts = [['UPDATE users SET name = ?, login = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
-      v.name, v.login, v.role, v.hourly_rate, v.active, person.id]];
+    const stmts = [['UPDATE users SET name = ?, login = ?, short_name = ?, work_hours = ?, role = ?, hourly_rate = ?, active = ? WHERE id = ?',
+      v.name, v.login, v.short_name, v.work_hours, v.role, v.hourly_rate, v.active, person.id]];
     if (v.secret) stmts.push(['UPDATE users SET secret_hash = ? WHERE id = ?', await hashSecret(v.secret), person.id]);
     // Sign the person out everywhere if their access changed.
     if (!self && (v.secret || !v.active || v.role !== person.role)) stmts.push(['DELETE FROM sessions WHERE user_id = ?', person.id]);
     try {
       await db.batch(stmts);
     } catch (err) {
-      if (isUnique(err)) return personPage(c, person, { error: 'That phone/staff ID is already in use.', values: v }, 400);
+      if (isUnique(err)) return personPage(c, person, { error: 'That phone/staff ID or short name is already in use.', values: v }, 400);
       throw err;
     }
     return c.redirect(withMsg('/admin/people', `${v.name} saved.`));
+  });
+
+  // ---------- Selfies ----------
+  app.get('/admin/photos/:id', async (c) => {
+    const photo = await c.get('db').get('SELECT data FROM photos WHERE id = ?', Number(c.req.param('id')));
+    if (!photo) return c.notFound();
+    const bytes = Uint8Array.from(atob(photo.data), (ch) => ch.charCodeAt(0));
+    return c.body(bytes, 200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400' });
+  });
+
+  // ---------- Attendance: late arrivals, early leaves, extra days off ----------
+  const fmtMins = (m) => (m == null ? '' : m >= 60 ? formatDuration(m * 60000) : `${m} min`);
+  const INCIDENT = { late: 'Late', early: 'Left early', missed: 'Missed shift', extra_off: 'Extra day off' };
+
+  async function attendanceData(c) {
+    const db = c.get('db');
+    const ym = monthParam(c.req.query('month'));
+    const uid = Number(c.req.query('user')) || null;
+    const settings = await getSettings(db);
+    return { ym, uid, settings, ...(await attendanceReport(db, ym, settings, { userId: uid })) };
+  }
+
+  app.get('/admin/attendance', async (c) => {
+    const { ym, uid, settings, rows, incidents, totals } = await attendanceData(c);
+    const q = (month) => `/admin/attendance?month=${month}${uid ? `&user=${uid}` : ''}`;
+    const person = uid && rows[0] ? rows[0].worker : null;
+    const grace = Number(settings.late_grace_min) || 0;
+    const allowance = Number(settings.days_off_per_week) || 0;
+    const split = workRanges(null, settings).length > 1 || rows.some((r) => workRanges(r.worker, settings).length > 1);
+    return render(c, {
+      title: 'Attendance',
+      active: 'attendance',
+      body: html`
+        <div class="row-between page-head">
+          <h1>Attendance${person ? html` <span class="muted">· ${person.name}</span>` : ''}</h1>
+          <div class="month-nav">
+            <a class="btn btn-small" href="${q(addMonths(ym, -1))}">‹</a>
+            <strong>${prettyMonth(ym)}</strong>
+            <a class="btn btn-small" href="${q(addMonths(ym, 1))}">›</a>
+          </div>
+        </div>
+        ${settings.attendance_mode !== 'on' ? html`<div class="alert alert-warn">The attendance record is off. Turn it on and set the working hours in <a href="/admin/settings">Settings</a>.</div>` : ''}
+        <div class="stats">
+          <div class="stat stat-amber"><span class="stat-num">${totals.late}</span><span class="stat-label">Late arrivals${totals.lateMin ? html` · ${fmtMins(totals.lateMin)}` : ''}</span></div>
+          <div class="stat stat-amber"><span class="stat-num">${totals.early}</span><span class="stat-label">Early leaves${totals.earlyMin ? html` · ${fmtMins(totals.earlyMin)}` : ''}</span></div>
+          <div class="stat stat-grey"><span class="stat-num">${totals.extraOff}</span><span class="stat-label">Extra days off</span></div>
+          <div class="stat stat-green"><span class="stat-num">${totals.worked}</span><span class="stat-label">Days worked</span></div>
+        </div>
+
+        <section class="card">
+          <div class="row-between">
+            <h2>${person ? 'Summary' : 'By person'}</h2>
+            <a class="btn btn-small" href="/admin/attendance.csv?month=${ym}${uid ? `&user=${uid}` : ''}">⬇ CSV</a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>Hours</th><th class="num">Days worked</th><th class="num">Days off</th><th class="num">Extra days off</th><th class="num">Late</th><th class="num">Mins late</th><th class="num">Left early</th><th class="num">Mins early</th>${split ? html`<th class="num">Missed shifts</th>` : ''}</tr></thead>
+              <tbody>
+                ${rows.map((r) => html`
+                  <tr>
+                    <td><a href="/admin/attendance?month=${ym}&user=${r.worker.id}">${r.worker.name}</a></td>
+                    <td class="muted small">${formatRanges(workRanges(r.worker, settings))}</td>
+                    <td class="num">${r.worked}</td><td class="num">${r.off}</td>
+                    <td class="num">${r.extraOff ? html`<strong class="flag">${r.extraOff}</strong>` : '—'}</td>
+                    <td class="num">${r.late ? html`<strong>${r.late}</strong>` : '—'}</td><td class="num">${r.lateMin ? fmtMins(r.lateMin) : '—'}</td>
+                    <td class="num">${r.early ? html`<strong>${r.early}</strong>` : '—'}</td><td class="num">${r.earlyMin ? fmtMins(r.earlyMin) : '—'}</td>
+                    ${split ? html`<td class="num">${r.missed || '—'}</td>` : ''}
+                  </tr>`)}
+              </tbody>
+            </table>
+          </div>
+          ${person ? html`<p><a href="/admin/attendance?month=${ym}">← Everyone</a></p>` : ''}
+          <p class="hint">A day without any clock-in is a day off. Each person may take ${allowance} day${allowance === 1 ? '' : 's'} off per week (Monday to Sunday);
+            more than that counts as an <strong>extra day off</strong>. Late = clocked in more than ${grace} min after the start of their hours; left early = clocked out more than
+            ${grace} min before the end. Clocking out and back in for a break counts once. Change these in <a href="/admin/settings">Settings</a>.</p>
+        </section>
+
+        <section class="card">
+          <h2>Each incident</h2>
+          ${incidents.length ? html`
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Date</th>${person ? '' : html`<th>Name</th>`}<th>What</th><th>Hours</th><th>Actual</th><th class="num">By</th><th></th></tr></thead>
+                <tbody>
+                  ${incidents.map((x) => html`
+                    <tr>
+                      <td>${prettyDate(x.work_date)}</td>
+                      ${person ? '' : html`<td>${x.name}</td>`}
+                      <td><span class="${x.type === 'extra_off' || x.type === 'missed' ? 'badge badge-rejected' : 'flag'}">${INCIDENT[x.type]}</span></td>
+                      <td>${x.schedStart ? `${localTime(x.schedStart)}–${localTime(x.schedEnd)}` : ''}</td>
+                      <td>${x.actual ? `${x.type === 'late' ? 'in' : 'out'} ${localTime(x.actual)}` : html`<span class="muted">no clock-in</span>`}</td>
+                      <td class="num">${fmtMins(x.minutes)}</td>
+                      <td>${x.shiftId ? html`<a href="/admin/shifts/${x.shiftId}">View</a>` : html`<a class="small" href="/admin/shifts/new?user_id=${x.user_id}&date=${x.work_date}">+ add shift</a>`}</td>
+                    </tr>`)}
+                </tbody>
+              </table>
+            </div>` : html`<p class="muted">No late arrivals, early leaves or extra days off. 🎉</p>`}
+          <p class="hint">Forgot to clock in? “+ add shift” records the day as worked.</p>
+        </section>`,
+    });
+  });
+
+  app.get('/admin/attendance.csv', async (c) => {
+    const { ym, uid, rows, incidents } = await attendanceData(c);
+    const out = [['Date', 'Day', 'Name', 'Short Name', 'What', 'Start', 'End', 'Actual Time', 'Minutes', 'Shift ID']];
+    const short = new Map(rows.map((r) => [r.worker.id, r.worker.short_name || '']));
+    for (const x of incidents) {
+      out.push([
+        x.work_date, new Date(`${x.work_date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' }),
+        x.name, short.get(x.user_id), INCIDENT[x.type], x.schedStart ? localTime(x.schedStart) : '', x.schedEnd ? localTime(x.schedEnd) : '',
+        x.actual ? localTime(x.actual) : '', x.minutes ?? '', x.shiftId ?? '',
+      ]);
+    }
+    out.push([]);
+    out.push(['Name', 'Short Name', 'Days Worked', 'Days Off', 'Extra Days Off', 'Times Late', 'Minutes Late', 'Times Left Early', 'Minutes Early', 'Missed Shifts']);
+    for (const r of rows) {
+      out.push([r.worker.name, r.worker.short_name || '', r.worked, r.off, r.extraOff, r.late, r.lateMin, r.early, r.earlyMin, r.missed]);
+    }
+    return sendCsv(c, `attendance-record-${ym}${uid ? `-${uid}` : ''}.csv`, out);
   });
 
   // ---------- Settings ----------
@@ -780,6 +967,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             <label>Alert when a worker uses this many different phones in 30 days
               <input type="number" name="device_alert_count" min="2" max="20" value="${s.device_alert_count}">
             </label>
+            <label>Selfie at clock-in
+              <select name="selfie_mode">
+                ${opt('selfie_mode', 'off', 'Off')}
+                ${opt('selfie_mode', 'flag', 'Ask for a selfie; flag if skipped')}
+                ${opt('selfie_mode', 'block', 'Selfie required to clock in')}
+              </select>
+              <span class="hint">Photos are small (about 30 KB), visible only to supervisors on the shift page, and deleted after ${PHOTO_KEEP_DAYS} days.</span>
+            </label>
             <label>Venue WiFi (public IP address)
               <select name="ip_mode">
                 ${opt('ip_mode', 'off', 'Off')}
@@ -791,6 +986,28 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <textarea name="allowed_ips" rows="2" placeholder="e.g. 203.0.113.25, 198.51.100.0/24">${s.allowed_ips}</textarea>
               <span class="hint">Your current IP address is <strong>${normalizeIp(c.get('ip'))}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
             </label>
+            <h3>Attendance record</h3>
+            <label>Late arrivals, early leaves and days off
+              <select name="attendance_mode">
+                ${opt('attendance_mode', 'off', 'Off')}
+                ${opt('attendance_mode', 'on', 'On — record them against the working hours')}
+              </select>
+              <span class="hint">No roster needed: a day without a clock-in is a day off, and staff can arrange their own days off. See the <a href="/admin/attendance">Attendance</a> page.</span>
+            </label>
+            <div class="grid-3">
+              <label>Working hours
+                <input name="work_hours" value="${s.work_hours}" required placeholder="10:00-22:00">
+                <span class="hint">For everyone, e.g. 10:00-22:00, or a split shift 10-14, 17-22. Someone with different hours: set them on their page under People.</span>
+              </label>
+              <label>Days off allowed per week
+                <input type="number" name="days_off_per_week" min="0" max="6" value="${s.days_off_per_week}">
+                <span class="hint">Monday to Sunday. More than this counts as an extra day off.</span>
+              </label>
+              <label>Grace period (minutes)
+                <input type="number" name="late_grace_min" min="0" max="60" value="${s.late_grace_min}">
+                <span class="hint">Arriving more than this after the start is late; leaving more than this before the end is early.</span>
+              </label>
+            </div>
             <div><button class="btn btn-primary" type="submit">Save settings</button></div>
           </form>
         </section>
@@ -827,13 +1044,26 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const b = await form(c);
     const pick = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
     const alertCount = Math.round(Number(b.device_alert_count));
+    const hours = parseRanges(b.work_hours);
+    const minutes = (v, max, fallback) => {
+      const n = Math.round(Number(v));
+      return v !== '' && n >= 0 && n <= max ? n : fallback;
+    };
     await c.get('db').batch([
       setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag')),
       setSettingStmt('ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('allowed_ips', String(b.allowed_ips || '').slice(0, 2000)),
       setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),
       setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
+      setSettingStmt('selfie_mode', pick(b.selfie_mode, ['off', 'flag', 'block'], 'off')),
+      setSettingStmt('attendance_mode', pick(b.attendance_mode, ['off', 'on'], 'off')),
+      setSettingStmt('late_grace_min', minutes(b.late_grace_min, 60, 5)),
+      setSettingStmt('days_off_per_week', minutes(b.days_off_per_week, 6, 1)),
+      ...(hours.ranges?.length ? [setSettingStmt('work_hours', formatRanges(hours.ranges))] : []),
     ]);
+    if (b.work_hours !== undefined && !hours.ranges?.length) {
+      return c.redirect(withMsg('/admin/settings', `Settings saved, but not the working hours: ${hours.error || 'enter them like 10:00-22:00.'}`));
+    }
     return c.redirect(withMsg('/admin/settings', 'Settings saved.'));
   });
 
@@ -971,7 +1201,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         s.in_site || '', s.in_distance_m ?? '', gps(s.in_lat, s.in_lng),
         s.out_site || '', s.out_distance_m ?? '', gps(s.out_lat, s.out_lng),
         deviceName(s.in_device_label, s.in_device_key) || '', deviceName(s.out_device_label, s.out_device_key) || '',
-        String(s.flags || '').split(',').filter(Boolean).map((f) => FLAG_LABELS[f] || f).join('; '),
+        String(s.flags || '').split(',').filter(Boolean).map((f) => flagLabel(f, { lateMin: minutesLate(s), earlyMin: minutesEarly(s) })).join('; '),
         s.id,
       ]);
     }

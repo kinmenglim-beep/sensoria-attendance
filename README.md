@@ -1,6 +1,7 @@
 # Attendance: check in/out for part-time and gig workers
 
 > **Using the app?** See **[MANUAL.md](MANUAL.md)** for the links and the worker and admin guides.
+> **Setting it up for the restaurant?** See **[RESTAURANT.md](RESTAURANT.md)**.
 
 A small web app that runs in the phone browser, so there is nothing to install. Workers clock in and out.
 Supervisors approve shifts and see who is missing. Management downloads a monthly CSV for payroll.
@@ -8,8 +9,9 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 ## What it does
 
 **Workers** (on their phone)
-- Sign in with their phone number or staff ID and a PIN. They stay signed in for 60 days.
-- One big **Clock IN / Clock OUT** button. The phone records GPS location and which device was used.
+- Sign in with their phone number, staff ID or **short name** (e.g. `KML`) and a PIN. They stay signed in for 60 days.
+- One big **Clock IN / Clock OUT** button. The phone records GPS location and which device was used, plus a selfie if turned on.
+- **Working hours and days off**: their hours and how many days off they've taken this week, when the attendance record is on.
 - **My hours**: each shift with check-in/out times, hours, status, who approved it and when, plus monthly totals and an estimated pay.
 
 **Supervisors**
@@ -18,6 +20,8 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 - **Shift detail**: distance from the venue with a map link, the device used, IP address, flags, and a full history (audit log).
   From here a supervisor can approve, reject (with a reason the worker can see), or correct the times.
 - **Add shift manually** for a worker who couldn't clock in (dead phone and so on).
+- **Attendance record** (optional): late arrivals, early leaves and extra days off against fixed working hours, with
+  no roster to maintain. Shown on the dashboard and listed per month on the **Attendance** page.
 - **People**: add workers and supervisors, set hourly rates, reset PINs, deactivate leavers. Each worker's page lists the devices they've used.
 - **Settings**: verification options and work sites (geofences).
 
@@ -34,6 +38,8 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 |---|---|---|---|---|
 | **GPS geofence** ✅ | The phone's location is compared with your venue(s) | None (one-time "allow location") | Medium | Works on any phone. Indoor GPS can be off by 20–100 m, so use a 100–200 m radius. |
 | **Device check** ✅ | Each worker's phone is registered; other phones, shared phones and frequent changes are flagged | None | Medium–High (catches buddy-punching) | Only supervisors can see it. Can be set to allow the registered phone only. |
+| **Selfie** (optional) | Front-camera photo at clock-in | One tap | High (stops buddy-punching) | Off by default. ~30 KB per photo, supervisors only, deleted after 90 days. |
+| **Attendance record** (optional) | Clock-ins are compared with the working hours | None | n/a (punctuality) | Off by default. Records late arrivals, early leaves and extra days off. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
 **Default setup: GPS in "flag" mode plus the device check.** Nobody is ever blocked from clocking in, even when GPS is
@@ -105,6 +111,36 @@ For long-term records, download the monthly CSVs from **Export**.
 | `APP_TZ` | `Asia/Kuala_Lumpur` | Time zone for work dates, display and exports |
 | `MAX_SHIFT_HOURS` | `16` | An open shift older than this counts as "forgot to clock out" |
 | `ROUND_MINUTES` | `15` | Round clock times to the nearest N minutes for pay; `0` turns rounding off |
+| `APP_NAME` | `Attendance` | Name shown in the menu bar and browser tab |
+
+### Attendance record
+
+For venues with fixed working hours that want a record of **late arrivals, early leaves and extra days off** (for
+warnings, separately from pay). There is **no roster**: staff arrange their own days off. Turn it on in
+**Settings → Attendance record**:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Late arrivals, early leaves and days off | Off | *On* records them |
+| Working hours | `10:00-22:00` | Everyone's hours; split shift `10-14, 17-22`; past midnight `18:00-01:00`. A person with different hours gets their own on their **People** page. |
+| Days off allowed per week | 1 | A day without any clock-in is a day off. More than this in a week (Monday to Sunday) counts as an **extra day off**. |
+| Grace period | 5 min | Arriving more than this after the start is late; leaving more than this before the end is early |
+
+The **Attendance** page shows, per month and per person: days worked, days off, extra days off, times late and
+minutes late, times left early and minutes early, plus every incident with the working hours and actual time. Click a
+name for one person's record; **CSV** downloads it. The dashboard shows who hasn't come in yet and flags anyone who
+already had their day off this week; workers see their hours and days off taken this week on their phone.
+
+How it counts: lateness uses the first clock-in of the day (or of each block of a split shift) and early leaving the
+last clock-out, so clocking out and in for a break counts once. Times corrected by a supervisor are used, and a
+forgotten clock-in can be added as a manual shift so the day counts as worked. A shift with a missing clock-out isn't
+counted as leaving early. Pay and the monthly export are not affected.
+
+### Short names
+
+Each person can have an optional **short name** (2–12 letters or digits, e.g. initials `KML`) on the People page.
+They can sign in with it instead of their phone number; it is not case-sensitive. Short names and phone/staff IDs
+must all be different.
 
 ### Self-hosting instead (optional)
 
@@ -151,5 +187,7 @@ Code layout:
 - `src/report.js`: monthly totals
 - `src/verify.js`: geofence and IP checks
 - `src/device.js`: device identification
+- `src/schedule.js`: working hours parsing and matching clock-ins to them
+- `src/attendance.js`: the monthly attendance record (late, early, extra days off)
 - `src/cloudflare.js` and `src/node.js`: entry points
 - `public/`: CSS and small scripts

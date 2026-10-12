@@ -1,12 +1,21 @@
-import { getSettings, auditStmt, addFlags } from '../db.js';
+import { getSettings, auditStmt, addFlags, removeFlags, PHOTO_KEEP_DAYS } from '../db.js';
 import { envVar } from '../env.js';
 import {
-  TZ, localDate, localTime, roundTime, addMonths, paidHours, formatDuration, formatHM, prettyDate, prettyMonth, isMonth,
+  TZ, localDate, localTime, roundTime, addDays, addMonths, paidHours, formatDuration, formatHM, prettyDate, prettyMonth, isMonth,
 } from '../time.js';
 import { checkGeofence, normalizeIp, parseAllowList, ipAllowed } from '../verify.js';
 import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { round2 } from '../report.js';
 import { resolveDevice, checkRegistration, recentDeviceCount } from '../device.js';
+import {
+  workRanges, daySlots, matchSlot, weekStart, minutesLate, minutesEarly,
+} from '../schedule.js';
+import { daysOff } from '../attendance.js';
+
+// Selfies arrive as a small JPEG data URL (the phone shrinks the photo before upload).
+const SELFIE_RE = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/;
+const SELFIE_MAX_CHARS = 400000;
+const parseSelfie = (v) => (typeof v === 'string' && v.length <= SELFIE_MAX_CHARS ? SELFIE_RE.exec(v)?.[1] ?? null : null);
 
 const num = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
 
@@ -30,6 +39,21 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     const todays = await db.all('SELECT * FROM shifts WHERE user_id = ? AND work_date = ? ORDER BY check_in_at', user.id, today);
     const action = open ? 'out' : 'in';
     const workedToday = todays.reduce((a, x) => a + (x.check_out_at ? paidHours(x.check_in_at, x.check_out_at) : 0), 0);
+    const tracking = s.attendance_mode === 'on';
+    const hours = workRanges(user, s);
+    // Days off taken so far this week (today counts once its working hours are over).
+    let offThisWeek = 0;
+    if (tracking) {
+      const week = weekStart(today);
+      const worked = new Set((await db.all('SELECT DISTINCT work_date FROM shifts WHERE user_id = ? AND work_date BETWEEN ? AND ?', user.id, week, today))
+        .map((r) => r.work_date));
+      const created = (await db.get('SELECT created_at FROM users WHERE id = ?', user.id)).created_at;
+      const todaySlots = daySlots(hours, today);
+      const over = !todaySlots.length || Date.parse(todaySlots[todaySlots.length - 1].endIso) <= Date.now();
+      offThisWeek = daysOff(worked, week, over ? today : addDays(today, -1), created).length;
+    }
+    const allowance = Number(s.days_off_per_week) || 0;
+    const askSelfie = !open && s.selfie_mode !== 'off';
 
     return render(c, {
       title: 'Clock in/out',
@@ -45,8 +69,15 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                      · <span data-elapsed-since="${open.check_in_at}">${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></p>`
             : html`<h1 class="clock-status">You're not clocked in</h1>
                    <p class="clock-since" data-clock="${TZ}"></p>`}
+          ${tracking && hours.length ? html`<p class="roster-today">Working hours: <strong>${hours.map((r) => `${r.start}–${r.end}`).join(', ')}</strong></p>
+            <p class="roster-today ${offThisWeek > allowance ? 'flag' : 'muted'}">Days off this week: ${offThisWeek} of ${allowance}</p>` : ''}
 
-          <form id="clock-form" class="stack" data-action="${action}" data-location="${s.geofence_mode}">
+          <form id="clock-form" class="stack" data-action="${action}" data-location="${s.geofence_mode}" data-selfie="${askSelfie ? s.selfie_mode : 'off'}">
+            ${askSelfie ? html`
+              <label class="selfie-picker">
+                <span class="selfie-preview" data-selfie-preview><span class="selfie-placeholder">📷<br>Tap to take a selfie${s.selfie_mode === 'block' ? '' : html`<br><small>(optional)</small>`}</span></span>
+                <input type="file" name="selfie" accept="image/*" capture="user" class="visually-hidden">
+              </label>` : ''}
             <label>Note (optional)
               <input name="note" maxlength="200" placeholder="${open ? 'e.g. left early, approved by Ali' : 'e.g. covering for Siti'}">
             </label>
@@ -92,6 +123,16 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
 
     const p = action; // flag prefix
     const flags = [];
+
+    // 0. Selfie at clock-in
+    let selfie = null;
+    if (action === 'in' && s.selfie_mode !== 'off') {
+      selfie = parseSelfie(body.selfie);
+      if (!selfie) {
+        if (s.selfie_mode === 'block') return c.json({ error: 'Please take a selfie first (tap the camera box).' }, 400);
+        flags.push('in:no_selfie');
+      }
+    }
     const loc = { lat: null, lng: null, accuracy: null, site: null, distance: null };
 
     // 1. GPS geofence
@@ -127,7 +168,33 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       flags.push(`${p}:off_network`);
     }
 
-    // 3. Device: the worker's registered phone, phones shared between workers, frequent phone changes.
+    // 3. Working hours: late arrival / early leave. Never blocks; only flagged.
+    let sched = { start: null, end: null };
+    let lateMin = 0;
+    const backFromBreak = [];
+    if (action === 'in' && s.attendance_mode === 'on') {
+      const today = localDate();
+      const hours = workRanges(c.get('user'), s);
+      const slots = [...daySlots(hours, addDays(today, -1)), ...daySlots(hours, today)];
+      // Anything from 3 hours before the start counts as clocking in for that block.
+      const m = matchSlot(slots, Date.now(), { earlyMin: 180, graceMin: Number(s.late_grace_min) || 0 });
+      if (m.status === 'ok' || m.status === 'late') {
+        sched = { start: m.slot.startIso, end: m.slot.endIso };
+        // Coming back from a break within the same working hours: not late again, and the
+        // earlier clock-out wasn't leaving early after all.
+        backFromBreak.push(...await db.all('SELECT id, flags FROM shifts WHERE user_id = ? AND sched_start = ?', uid, sched.start));
+        if (m.status === 'late' && !backFromBreak.length) {
+          flags.push('in:late');
+          lateMin = m.lateMin;
+        }
+      }
+    }
+    if (action === 'out' && open.sched_end && s.attendance_mode === 'on'
+      && Date.now() < Date.parse(open.sched_end) - (Number(s.late_grace_min) || 0) * 60000) {
+      flags.push('out:left_early');
+    }
+
+    // 4. Device: the worker's registered phone, phones shared between workers, frequent phone changes.
     const device = await resolveDevice(c, db, body, { secure: c.get('secure') });
     if (s.device_mode !== 'off') {
       const { registered } = await checkRegistration(db, uid, device.id);
@@ -165,14 +232,24 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
           stmts.push(auditStmt(forgotten.id, null, 'auto_closed', 'Worker never clocked out; a supervisor needs to enter the check-out time'));
         }
         stmts.push([`
-          INSERT INTO shifts (user_id, work_date, check_in_at, in_lat, in_lng, in_accuracy, in_site, in_distance_m, in_ip, in_device_id, flags, worker_note)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, uid, localDate(now), now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, addFlags('', ...flags), note]);
+          INSERT INTO shifts (user_id, work_date, check_in_at, in_lat, in_lng, in_accuracy, in_site, in_distance_m, in_ip, in_device_id,
+            sched_start, sched_end, flags, worker_note)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, uid, localDate(now), now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id,
+        sched.start, sched.end, addFlags('', ...flags), note]);
         const results = await db.batch(stmts);
-        await db.run(...auditStmt(results[results.length - 1].lastId, uid, 'clock_in'));
+        const shiftId = results[results.length - 1].lastId;
+        const after = [auditStmt(shiftId, uid, 'clock_in')];
+        for (const x of backFromBreak) after.push(['UPDATE shifts SET flags = ? WHERE id = ?', removeFlags(x.flags, 'out:left_early'), x.id]);
+        if (selfie) {
+          after.push(['INSERT INTO photos (shift_id, kind, data, taken_at) VALUES (?, ?, ?, ?)', shiftId, 'in', selfie, now]);
+          after.push(['DELETE FROM photos WHERE taken_at < ?', new Date(Date.now() - PHOTO_KEEP_DAYS * 86400000).toISOString()]);
+        }
+        await db.batch(after);
         // Device flags are for supervisors only, so only location/network issues are mentioned here.
         const reviewNeeded = flags.some((f) => /no_location|outside_area|off_network/.test(f));
-        return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked in at ${localTime(now)}.${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
+        const timing = lateMin ? ` You're ${lateMin} min late.` : '';
+        return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked in at ${localTime(now)}.${timing}${reviewNeeded ? ' Your supervisor will review the location.' : ''}` });
       }
 
       const workerNote = [open.worker_note, note].filter(Boolean).join(' / ') || null;
@@ -239,10 +316,11 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                 <div>In ${clockTime(x.check_in_at)} → Out ${x.check_out_at ? clockTime(x.check_out_at) : '—'}${x.check_out_at && localDate(x.check_out_at) !== x.work_date ? html` <small class="muted">(next day)</small>` : ''}</div>
                 ${x.reviewer_name ? html`<div class="muted small">${x.status === 'approved' ? 'Approved' : 'Rejected'} by ${x.reviewer_name} · ${prettyDate(localDate(x.reviewed_at))} ${localTime(x.reviewed_at)}</div>` : ''}
                 ${x.review_note ? html`<div class="small">“${x.review_note}”</div>` : ''}
-                ${flagList(x.flags, { forWorker: true })}
+                ${flagList(x.flags, { forWorker: true, lateMin: minutesLate(x), earlyMin: minutesEarly(x) })}
               </li>`)}
           </ul>` : html`<p class="muted">No shifts this month.</p>`}
         </section>`,
     });
   });
 }
+

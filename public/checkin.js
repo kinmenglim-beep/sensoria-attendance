@@ -5,11 +5,57 @@
   if (!form) return;
   const status = form.querySelector('[data-form-status]');
   const button = form.querySelector('button[type="submit"]');
+  const selfieInput = form.querySelector('input[name="selfie"]');
+  const preview = form.querySelector('[data-selfie-preview]');
+  let selfieData = null;
 
   const say = (msg, kind = '') => {
     status.textContent = msg;
     status.className = `form-status ${kind}`;
   };
+
+  // Shrink the photo before upload: phone cameras produce multi-MB files.
+  function compress(file, maxSize = 480, quality = 0.7) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(img.naturalWidth, img.naturalHeight));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.naturalWidth * scale);
+        canvas.height = Math.round(img.naturalHeight * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Could not read the photo. Please try again.'));
+      };
+      img.src = url;
+    });
+  }
+
+  if (selfieInput) {
+    selfieInput.addEventListener('change', async () => {
+      const file = selfieInput.files[0];
+      if (!file) return;
+      try {
+        say('Preparing photo…');
+        selfieData = await compress(file);
+        preview.replaceChildren();
+        const img = new Image();
+        img.src = selfieData;
+        img.alt = 'Your selfie';
+        preview.appendChild(img);
+        preview.classList.add('has-photo');
+        say('');
+      } catch (err) {
+        selfieData = null;
+        say(err.message, 'error');
+      }
+    });
+  }
 
   function getPosition() {
     return new Promise((resolve, reject) => {
@@ -42,6 +88,11 @@
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const body = { action: form.dataset.action, note: form.elements.note.value };
+    if (form.dataset.selfie === 'block' && !selfieData) {
+      say('Please take a selfie first (tap the camera box).', 'error');
+      return;
+    }
+    if (selfieData) body.selfie = selfieData;
 
     button.disabled = true;
     try {

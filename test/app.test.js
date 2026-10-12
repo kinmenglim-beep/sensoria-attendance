@@ -324,3 +324,187 @@ test('bulk approval handles more shifts than one database query allows', async (
   assert.match(r.location, /Approved%20150%20shifts/);
   assert.equal((await db.get("SELECT COUNT(*) AS n FROM audit WHERE action = 'approve'")).n, 150);
 });
+
+/** Supervisor + one worker, GPS off; returns clients and the worker's id. */
+async function restaurant(settings = {}) {
+  const ctx = makeApp();
+  const sup = ctx.client();
+  const wkr = ctx.client();
+  await sup('POST', '/setup', { form: { name: 'Boss', login: 'boss', secret: 'password1' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', ip_mode: 'off', allowed_ips: '', device_mode: 'flag', ...settings } });
+  await sup('POST', '/admin/people', { form: { name: 'Lim Kin Meng', login: '0123456789', short_name: 'KML', role: 'worker', secret: '1234' } });
+  const { id } = await ctx.db.get("SELECT id FROM users WHERE login = '0123456789'");
+  return { ...ctx, sup, wkr, uid: id };
+}
+
+test('working hours: late arrival, early leave, and a break counted once', async () => {
+  const { localTime } = await import('../src/time.js');
+  const start = new Date(Date.now() - 20 * 60000);
+  const end = new Date(start.getTime() + 4 * 3600000);
+  const { sup, wkr, db } = await restaurant({ attendance_mode: 'on', work_hours: `${localTime(start)}-${localTime(end)}`, late_grace_min: '5' });
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  let r = await wkr('GET', '/');
+  assert.match(r.text, /Working hours: <strong>/);
+  assert.match(r.text, /Days off this week: \d of 1/);
+
+  r = await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  assert.match(JSON.parse(r.text).message, /You're (20|21) min late/);
+  await wkr('POST', '/api/clock', { json: { action: 'out' } });
+  let first = await db.get('SELECT * FROM shifts ORDER BY id LIMIT 1');
+  assert.equal(first.flags, 'in:late,out:left_early');
+  assert.ok(first.sched_start && first.sched_end);
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /Late (20|21) min/);
+  assert.match(r.text, /Left \d+ min early/);
+
+  // Back from a break: not late again, and the earlier clock-out wasn't leaving early after all.
+  r = await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  assert.doesNotMatch(JSON.parse(r.text).message, /late/);
+  first = await db.get('SELECT * FROM shifts ORDER BY id LIMIT 1');
+  assert.equal(first.flags, 'in:late');
+  assert.equal((await db.get('SELECT flags FROM shifts ORDER BY id DESC LIMIT 1')).flags, '');
+
+  r = await sup('GET', '/admin/attendance');
+  assert.equal(r.status, 200);
+  assert.match(r.text, /href="\/admin\/attendance"/); // menu link once the record is on
+  // The pay export is unchanged.
+  r = await sup('GET', `/admin/export/summary.csv?month=${localDate().slice(0, 7)}`);
+  assert.doesNotMatch(r.text, /Late/);
+});
+
+test('working hours: everyone’s in Settings, or a person’s own', async () => {
+  const { sup, db, uid } = await restaurant({ attendance_mode: 'on', work_hours: '10-22' });
+  assert.equal((await db.get("SELECT value FROM settings WHERE key = 'work_hours'")).value, '10:00-22:00');
+  let r = await sup('POST', '/admin/settings', { form: { attendance_mode: 'on', work_hours: 'lunch', days_off_per_week: '1', late_grace_min: '5' } });
+  assert.match(decodeURIComponent(r.location), /not the working hours/);
+  assert.equal((await db.get("SELECT value FROM settings WHERE key = 'work_hours'")).value, '10:00-22:00');
+
+  const person = { name: 'Lim Kin Meng', login: '0123456789', short_name: 'KML', role: 'worker', active: '1' };
+  r = await sup('POST', `/admin/people/${uid}`, { form: { ...person, work_hours: 'evening' } });
+  assert.equal(r.status, 400);
+  r = await sup('POST', `/admin/people/${uid}`, { form: { ...person, work_hours: '5pm-11pm' } });
+  assert.equal(r.status, 302);
+  assert.equal((await db.get('SELECT work_hours FROM users WHERE id = ?', uid)).work_hours, '17:00-23:00');
+  r = await sup('POST', `/admin/people/${uid}`, { form: { ...person, work_hours: '' } });
+  assert.equal((await db.get('SELECT work_hours FROM users WHERE id = ?', uid)).work_hours, null);
+});
+
+test('attendance record: days off, extra days off, late and early', async () => {
+  const { sup, db, uid } = await restaurant({ attendance_mode: 'on', work_hours: '10:00-22:00', days_off_per_week: '1', late_grace_min: '5' });
+  await sup('POST', '/admin/people', { form: { name: 'Siti', login: '0198887777', short_name: 'SITI', role: 'worker', secret: '5678' } });
+  const siti = (await db.get("SELECT id FROM users WHERE short_name = 'SITI'")).id;
+  const { addDays, localToUtcIso } = await import('../src/time.js');
+  const { slotTimes, weekStart } = await import('../src/schedule.js');
+  const { attendanceReport } = await import('../src/attendance.js');
+  const { getSettings } = await import('../src/db.js');
+
+  // Last week, Monday to Sunday; both people were added before it.
+  const mon = addDays(weekStart(localDate()), -7);
+  const day = (i) => addDays(mon, i);
+  await db.run('UPDATE users SET created_at = ?', localToUtcIso(addDays(mon, -30), '00:00'));
+  const shift = (user, d, inT, outT) => {
+    const t = slotTimes(d, '10:00', '22:00');
+    return db.run('INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, sched_start, sched_end) VALUES (?, ?, ?, ?, ?, ?)',
+      user, d, localToUtcIso(d, inT), localToUtcIso(d, outT), t.startIso, t.endIso);
+  };
+  // Lim: late Monday, a break and an early finish Tuesday, off Saturday and Sunday (one too many).
+  await shift(uid, day(0), '10:12', '22:00');
+  await shift(uid, day(1), '10:00', '15:00');
+  await shift(uid, day(1), '15:30', '21:30');
+  await shift(uid, day(2), '09:55', '22:03');
+  await shift(uid, day(3), '10:00', '22:00');
+  await shift(uid, day(4), '10:04', '21:56');
+  // Siti: off Wednesday only.
+  for (const i of [0, 1, 3, 4, 5, 6]) await shift(siti, day(i), '09:58', '22:01');
+
+  const weekIncidents = async (settingsOverride = {}) => {
+    const settings = { ...(await getSettings(db)), ...settingsOverride };
+    const months = [...new Set([mon.slice(0, 7), day(6).slice(0, 7)])];
+    const all = [];
+    for (const ym of months) all.push(...(await attendanceReport(db, ym, settings)).incidents);
+    return all.filter((x) => x.work_date >= mon && x.work_date <= day(6))
+      .map((x) => `${x.name}|${x.work_date === mon ? 'Mon' : x.work_date === day(1) ? 'Tue' : x.work_date === day(6) ? 'Sun' : x.work_date}|${x.type}|${x.minutes ?? ''}`);
+  };
+  assert.deepEqual(await weekIncidents(), ['Lim Kin Meng|Mon|late|12', 'Lim Kin Meng|Tue|early|30', 'Lim Kin Meng|Sun|extra_off|']);
+  // Two days off allowed: no extra day off.
+  assert.deepEqual(await weekIncidents({ days_off_per_week: '2' }), ['Lim Kin Meng|Mon|late|12', 'Lim Kin Meng|Tue|early|30']);
+
+  // The page and CSV.
+  let r = await sup('GET', `/admin/attendance?month=${mon.slice(0, 7)}`);
+  assert.match(r.text, /Extra day off/);
+  assert.match(r.text, /in 10:12/);
+  r = await sup('GET', `/admin/attendance.csv?month=${day(6).slice(0, 7)}`);
+  assert.match(r.text, new RegExp(`${day(6)},Sun,Lim Kin Meng,KML,Extra day off,,,,,`));
+  r = await sup('GET', `/admin/attendance?month=${mon.slice(0, 7)}&user=${siti}`);
+  assert.match(r.text, /Attendance <span class="muted">· Siti/);
+  assert.doesNotMatch(r.text, /Lim Kin Meng/);
+
+  // Lim forgot to clock in on Saturday: a supervisor adds the shift, and Saturday counts as worked.
+  r = await sup('POST', '/admin/shifts/new', { form: { user_id: String(uid), work_date: day(5), in_time: '10:30', out_time: '22:00' } });
+  assert.equal(r.status, 302);
+  const sat = day(5) === mon ? 'Mon' : day(5);
+  assert.deepEqual(await weekIncidents(), ['Lim Kin Meng|Mon|late|12', 'Lim Kin Meng|Tue|early|30', `Lim Kin Meng|${sat}|late|30`]);
+});
+
+test('selfie: required, stored with the shift and shown to supervisors only', async () => {
+  const { sup, wkr, db } = await restaurant({ selfie_mode: 'block' });
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  let r = await wkr('GET', '/');
+  assert.match(r.text, /Tap to take a selfie/);
+  r = await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 400);
+  r = await wkr('POST', '/api/clock', { json: { action: 'in', selfie: 'data:image/png;base64,AAAA' } });
+  assert.equal(r.status, 400);
+
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
+  r = await wkr('POST', '/api/clock', { json: { action: 'in', selfie: `data:image/jpeg;base64,${jpeg.toString('base64')}` } });
+  assert.equal(r.status, 200, r.text);
+  const photo = await db.get('SELECT * FROM photos');
+  const shift = await db.get('SELECT * FROM shifts');
+  assert.equal(photo.shift_id, shift.id);
+  // Old photos are pruned.
+  await db.run('INSERT INTO photos (shift_id, kind, data, taken_at) VALUES (?, ?, ?, ?)', shift.id, 'in', 'AAAA', '2020-01-01T00:00:00Z');
+
+  r = await sup('GET', `/admin/shifts/${shift.id}`);
+  assert.match(r.text, new RegExp(`src="/admin/photos/${photo.id}"`));
+  const img = await sup('GET', `/admin/photos/${photo.id}`);
+  assert.equal(img.headers.get('content-type'), 'image/jpeg');
+  assert.equal((await wkr('GET', `/admin/photos/${photo.id}`)).status, 302);
+
+  await wkr('POST', '/api/clock', { json: { action: 'out' } });
+  await wkr('POST', '/api/clock', { json: { action: 'in', selfie: `data:image/jpeg;base64,${jpeg.toString('base64')}` } });
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM photos')).n, 2);
+
+  // "Ask" mode lets them skip it, flagged.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', ip_mode: 'off', selfie_mode: 'flag' } });
+  await wkr('POST', '/api/clock', { json: { action: 'out' } });
+  r = await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 200);
+  assert.equal((await db.get('SELECT flags FROM shifts ORDER BY id DESC LIMIT 1')).flags, 'in:no_selfie');
+});
+
+test('older databases gain the new columns', async () => {
+  const { ensureSchema } = await import('../src/db.js');
+  const db = new NodeDb(':memory:');
+  await ensureSchema(db);
+  await db.run('DROP INDEX users_short_name');
+  await db.run('ALTER TABLE users DROP COLUMN short_name');
+  await db.run('ALTER TABLE shifts DROP COLUMN sched_start');
+  await db.run('ALTER TABLE shifts DROP COLUMN sched_end');
+  await ensureSchema(db);
+  await ensureSchema(db); // idempotent
+  const cols = (t) => db.all(`PRAGMA table_info(${t})`).then((rows) => rows.map((r) => r.name));
+  assert.ok((await cols('users')).includes('short_name'));
+  assert.ok((await cols('shifts')).includes('sched_end'));
+});
+
+test('APP_NAME sets the name shown in the app', async () => {
+  process.env.APP_NAME = 'Makan Place';
+  try {
+    const { client } = makeApp();
+    const r = await client()('GET', '/setup');
+    assert.match(r.text, /<title>First-time setup · Makan Place<\/title>/);
+  } finally {
+    delete process.env.APP_NAME;
+  }
+});

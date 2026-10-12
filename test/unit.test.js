@@ -90,3 +90,44 @@ test('times round to the nearest quarter hour for pay', () => {
   time.setRounding(undefined);
   assert.equal(time.ROUND_MINUTES, 15);
 });
+
+test('roster cells parse into time ranges', async () => {
+  const { parseRanges, formatRanges, weekStart, slotTimes } = await import('../src/schedule.js');
+  assert.deepEqual(parseRanges('10-15').ranges, [{ start: '10:00', end: '15:00' }]);
+  assert.deepEqual(parseRanges('17:00-22:30, 10:00 - 14:00').ranges,
+    [{ start: '10:00', end: '14:00' }, { start: '17:00', end: '22:30' }]);
+  assert.deepEqual(parseRanges('6pm to 1am').ranges, [{ start: '18:00', end: '01:00' }]);
+  assert.deepEqual(parseRanges('930-1430').ranges, [{ start: '09:30', end: '14:30' }]);
+  assert.deepEqual(parseRanges('12pm-12am').ranges, [{ start: '12:00', end: '00:00' }]);
+  for (const blank of ['', ' ', 'off', 'OFF', '-']) assert.deepEqual(parseRanges(blank).ranges, []);
+  for (const bad of ['10', '25-26', '10-10', 'lunch', '13pm-2pm', '10:75-12']) assert.ok(parseRanges(bad).error, bad);
+  assert.equal(formatRanges(parseRanges('10-14, 17-22').ranges), '10:00-14:00, 17:00-22:00');
+  assert.equal(weekStart('2026-10-10'), '2026-10-05'); // Saturday → Monday
+  assert.equal(weekStart('2026-10-05'), '2026-10-05');
+  assert.equal(weekStart('2026-10-11'), '2026-10-05'); // Sunday
+  // A shift past midnight ends the next day.
+  assert.deepEqual(slotTimes('2026-10-05', '18:00', '01:00'),
+    { startIso: '2026-10-05T10:00:00.000Z', endIso: '2026-10-05T17:00:00.000Z' });
+});
+
+test('clock-ins are matched to the rostered shift', async () => {
+  const { matchSlot, slotTimes } = await import('../src/schedule.js');
+  const slot = (date, start, end) => ({ work_date: date, start_time: start, end_time: end, ...slotTimes(date, start, end) });
+  const slots = [slot('2026-10-05', '10:00', '14:00'), slot('2026-10-05', '17:00', '22:00')];
+  const at = (hhmm) => Date.parse(time.localToUtcIso('2026-10-05', hhmm));
+  const opts = { earlyMin: 30, graceMin: 5 };
+  assert.equal(matchSlot(slots, at('09:40'), opts).status, 'ok');
+  assert.equal(matchSlot(slots, at('10:05'), opts).status, 'ok');
+  assert.deepEqual(
+    (({ status, lateMin }) => ({ status, lateMin }))(matchSlot(slots, at('10:12'), opts)),
+    { status: 'late', lateMin: 12 },
+  );
+  const early = matchSlot(slots, at('09:00'), opts);
+  assert.equal(early.status, 'too_early');
+  assert.equal(time.localTime(early.opensAt), '09:30');
+  // Between the split shifts: the dinner shift isn't open yet.
+  assert.equal(matchSlot(slots, at('15:00'), opts).status, 'too_early');
+  assert.equal(matchSlot(slots, at('16:45'), opts).slot.start_time, '17:00');
+  assert.equal(matchSlot(slots, at('22:30'), opts).status, 'none');
+  assert.equal(matchSlot([], at('10:00'), opts).status, 'none');
+});

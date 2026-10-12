@@ -19,6 +19,8 @@ happened (no rounding).
 
 ## 1. Deploy (once, about 10 minutes, free)
 
+0. Make sure these changes are on the `main` branch on GitHub (Cloudflare deploys from `main`). Merging them also
+   updates the other venue's app; everything new there is off by default, so it keeps working as before.
 1. In the Cloudflare dashboard (the same account is fine): **Workers & Pages → Create → Import a repository** and pick
    `sensoria-attendance` again.
 2. On the setup screen:

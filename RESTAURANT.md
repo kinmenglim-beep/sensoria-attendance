@@ -1,4 +1,4 @@
-# Restaurant setup
+# Restaurant setup (Ossu)
 
 The restaurant runs **the same app** as the other venue, deployed a second time with its **own link and its own
 database**. Staff, hours and settings are completely separate. Bug fixes and improvements reach both, because they
@@ -25,16 +25,15 @@ happened (no rounding).
 1. In the Cloudflare dashboard (the same account is fine): **Workers & Pages → Create → Import a repository** and pick
    `sensoria-attendance` again.
 2. On the setup screen:
-   - Project name: **`restaurant-attendance`** (it must match `name` in `wrangler.restaurant.jsonc`).
-   - **Deploy command:** `npx wrangler deploy --config wrangler.restaurant.jsonc`
+   - Project name: **`ossu-attendance`** (it must match `name` in `wrangler.ossu.jsonc`).
+   - **Deploy command:** `npx wrangler deploy --config wrangler.ossu.jsonc`
    - **Production branch** (if asked, under advanced settings): `claude/gig-worker-checkin-system-dmyys6`
 3. Click **Deploy**. The first deploy creates the restaurant's own database. The link looks like
-   `https://restaurant-attendance.<your-name>.workers.dev`.
-4. Optional: change the name shown in the app by editing `APP_NAME` in `wrangler.restaurant.jsonc` (e.g. your
-   restaurant's name) and pushing.
+   `https://ossu-attendance.<your-name>.workers.dev`.
+4. The app shows "Ossu Attendance" in the menu bar; change `APP_NAME` in `wrangler.ossu.jsonc` to rename it.
 
-If the first deploy fails with a database error, create a D1 database called `restaurant-attendance`
-(**Storage & Databases → D1 → Create**) and add its `"database_id"` to `wrangler.restaurant.jsonc`, as described in the README.
+If the first deploy fails with a database error, create a D1 database called `ossu-attendance`
+(**Storage & Databases → D1 → Create**) and add its `"database_id"` to `wrangler.ossu.jsonc`, as described in the README.
 
 ## 2. First-time setup in the app
 

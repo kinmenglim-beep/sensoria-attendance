@@ -57,12 +57,47 @@ export function weekStart(date) {
   return addDays(date, -((dow + 6) % 7));
 }
 
-/** Roster rows for one worker between two dates (inclusive), with UTC start/end. */
-export async function rosterSlots(db, userId, fromDate, toDate) {
-  const rows = await db.all(
-    'SELECT * FROM roster WHERE user_id = ? AND work_date BETWEEN ? AND ? ORDER BY work_date, start_time',
-    userId, fromDate, toDate,
+// A roster row with this start_time means "off that day", overriding the usual hours.
+export const OFF = 'off';
+
+/** 0 = Monday … 6 = Sunday. */
+export function weekdayIndex(date) {
+  const [y, m, d] = date.split('-').map(Number);
+  return (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+}
+
+/**
+ * Who works when between two dates (inclusive): roster rows for a specific date win,
+ * otherwise each active worker's usual weekly hours apply. Optionally for one worker.
+ * Returns [{ user_id, work_date, start_time, end_time, override }] sorted by date and start.
+ */
+export async function effectiveRoster(db, fromDate, toDate, userId = null) {
+  const only = userId ? ' AND user_id = ?' : '';
+  const params = userId ? [userId] : [];
+  const specific = await db.all(
+    `SELECT user_id, work_date, start_time, end_time FROM roster WHERE work_date BETWEEN ? AND ?${only}`,
+    fromDate, toDate, ...params,
   );
+  const usual = await db.all(`
+    SELECT h.user_id, h.weekday, h.start_time, h.end_time FROM usual_hours h JOIN users u ON u.id = h.user_id
+    WHERE u.active = 1 AND u.role = 'worker'${only.replace('user_id', 'h.user_id')}
+  `, ...params);
+  const overridden = new Set(specific.map((r) => `${r.user_id}|${r.work_date}`));
+  const out = specific.filter((r) => r.start_time !== OFF).map((r) => ({ ...r, override: true }));
+  for (let d = fromDate; d <= toDate; d = addDays(d, 1)) {
+    const wd = weekdayIndex(d);
+    for (const u of usual) {
+      if (u.weekday === wd && !overridden.has(`${u.user_id}|${d}`)) {
+        out.push({ user_id: u.user_id, work_date: d, start_time: u.start_time, end_time: u.end_time, override: false });
+      }
+    }
+  }
+  return out.sort((a, b) => a.work_date.localeCompare(b.work_date) || a.start_time.localeCompare(b.start_time));
+}
+
+/** One worker's rostered shifts between two dates (inclusive), with UTC start/end. */
+export async function rosterSlots(db, userId, fromDate, toDate) {
+  const rows = await effectiveRoster(db, fromDate, toDate, userId);
   return rows.map((r) => ({ ...r, ...slotTimes(r.work_date, r.start_time, r.end_time) }));
 }
 
@@ -88,4 +123,10 @@ export function matchSlot(slots, nowMs, { earlyMin, graceMin }) {
 export function minutesLate(shift) {
   if (!shift.sched_start) return 0;
   return Math.max(0, Math.floor((Date.parse(shift.check_in_at) - Date.parse(shift.sched_start)) / 60000));
+}
+
+/** Whole minutes between the check-out and the rostered end (0 if they stayed until the end). */
+export function minutesEarly(shift) {
+  if (!shift.sched_end || !shift.check_out_at) return 0;
+  return Math.max(0, Math.floor((Date.parse(shift.sched_end) - Date.parse(shift.check_out_at)) / 60000));
 }

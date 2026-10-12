@@ -7,7 +7,7 @@ import { checkGeofence, normalizeIp, parseAllowList, ipAllowed } from '../verify
 import { html, statusBadge, flagList, fmtHours, fmtMoney, clockTime } from '../views.js';
 import { round2 } from '../report.js';
 import { resolveDevice, checkRegistration, recentDeviceCount } from '../device.js';
-import { rosterSlots, matchSlot, minutesLate } from '../schedule.js';
+import { rosterSlots, matchSlot, minutesLate, minutesEarly } from '../schedule.js';
 
 // Selfies arrive as a small JPEG data URL (the phone shrinks the photo before upload).
 const SELFIE_RE = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/;
@@ -317,7 +317,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
                 <div>In ${clockTime(x.check_in_at)} → Out ${x.check_out_at ? clockTime(x.check_out_at) : '—'}${x.check_out_at && localDate(x.check_out_at) !== x.work_date ? html` <small class="muted">(next day)</small>` : ''}</div>
                 ${x.reviewer_name ? html`<div class="muted small">${x.status === 'approved' ? 'Approved' : 'Rejected'} by ${x.reviewer_name} · ${prettyDate(localDate(x.reviewed_at))} ${localTime(x.reviewed_at)}</div>` : ''}
                 ${x.review_note ? html`<div class="small">“${x.review_note}”</div>` : ''}
-                ${flagList(x.flags, { forWorker: true, lateMin: minutesLate(x) })}
+                ${flagList(x.flags, { forWorker: true, lateMin: minutesLate(x), earlyMin: minutesEarly(x) })}
               </li>`)}
           </ul>` : html`<p class="muted">No shifts this month.</p>`}
         </section>`,

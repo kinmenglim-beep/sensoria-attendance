@@ -55,13 +55,17 @@ export const FLAG_LABELS = {
 // Device flags are only shown to supervisors.
 const SUPERVISOR_ONLY = (f) => f.includes('device');
 
-/** Readable flag; pass lateMin to show "Late 12 min". */
-export const flagLabel = (f, { lateMin = 0 } = {}) => (f === 'in:late' && lateMin ? `Late ${lateMin} min` : FLAG_LABELS[f] || f);
+/** Readable flag; pass lateMin / earlyMin to show "Late 12 min" / "Left 30 min early". */
+export function flagLabel(f, { lateMin = 0, earlyMin = 0 } = {}) {
+  if (f === 'in:late' && lateMin) return `Late ${lateMin} min`;
+  if (f === 'out:left_early' && earlyMin) return `Left ${earlyMin} min early`;
+  return FLAG_LABELS[f] || f;
+}
 
-export function flagList(flags, { forWorker = false, lateMin = 0 } = {}) {
+export function flagList(flags, { forWorker = false, lateMin = 0, earlyMin = 0 } = {}) {
   const list = String(flags || '').split(',').filter((f) => f && !(forWorker && SUPERVISOR_ONLY(f)));
   if (!list.length) return '';
-  const content = html`${list.map((f) => html`<span class="flag">${flagLabel(f, { lateMin })}</span>`)}`;
+  const content = html`${list.map((f) => html`<span class="flag">${flagLabel(f, { lateMin, earlyMin })}</span>`)}`;
   return forWorker ? html`<div>${content}</div>` : content;
 }
 
@@ -97,7 +101,7 @@ function nav(user, active, { roster = false } = {}) {
     ? [
       link('/admin', 'Dashboard', 'dashboard'),
       link('/admin/pending', 'Approvals', 'pending'),
-      ...(roster ? [link('/admin/roster', 'Roster', 'roster')] : []),
+      ...(roster ? [link('/admin/attendance', 'Attendance', 'attendance'), link('/admin/roster', 'Roster', 'roster')] : []),
       link('/admin/export', 'Export', 'export'),
       link('/admin/people', 'People', 'people'),
       link('/admin/settings', 'Settings', 'settings'),

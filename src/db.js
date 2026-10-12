@@ -104,6 +104,15 @@ const SCHEMA = [
     end_time   TEXT NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS roster_by_date ON roster(work_date, user_id)',
+  // Each worker's usual weekly hours (weekday 0 = Monday). Roster rows for a date replace these;
+  // a roster row with start_time 'off' marks a usual working day as off.
+  `CREATE TABLE IF NOT EXISTS usual_hours (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    weekday    INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+    start_time TEXT NOT NULL,
+    end_time   TEXT NOT NULL
+  )`,
   // Clock-in selfies, stored as base64 JPEG (~30 KB each) and pruned after PHOTO_KEEP_DAYS.
   `CREATE TABLE IF NOT EXISTS photos (
     id       INTEGER PRIMARY KEY,
@@ -141,7 +150,7 @@ export const DEFAULT_SETTINGS = {
   device_alert_count: '3',
   // off | flag | block — compare clock-ins with the roster (late, too early, not rostered).
   schedule_mode: 'off',
-  // Minutes after the rostered start before a clock-in counts as late.
+  // Minutes of leeway before arriving counts as late, or leaving counts as early.
   late_grace_min: '5',
   // How many minutes before the rostered start a worker may clock in.
   early_clockin_min: '30',

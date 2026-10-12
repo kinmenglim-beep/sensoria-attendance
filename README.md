@@ -20,8 +20,8 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 - **Shift detail**: distance from the venue with a map link, the device used, IP address, flags, and a full history (audit log).
   From here a supervisor can approve, reject (with a reason the worker can see), or correct the times.
 - **Add shift manually** for a worker who couldn't clock in (dead phone and so on).
-- **Roster** (optional): who works when, week by week. Clock-ins are compared with it: **late**, **too early**,
-  **not rostered** and **left early** are flagged, and the dashboard shows who is late or missed their shift.
+- **Roster and attendance record** (optional): each person's usual working hours plus one-off changes. Late arrivals,
+  early leaves and no-shows are flagged, shown on the dashboard, and listed per month on the **Attendance** page.
 - **People**: add workers and supervisors, set hourly rates, reset PINs, deactivate leavers. Each worker's page lists the devices they've used.
 - **Settings**: verification options and work sites (geofences).
 
@@ -39,7 +39,7 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 | **GPS geofence** ✅ | The phone's location is compared with your venue(s) | None (one-time "allow location") | Medium | Works on any phone. Indoor GPS can be off by 20–100 m, so use a 100–200 m radius. |
 | **Device check** ✅ | Each worker's phone is registered; other phones, shared phones and frequent changes are flagged | None | Medium–High (catches buddy-punching) | Only supervisors can see it. Can be set to allow the registered phone only. |
 | **Selfie** (optional) | Front-camera photo at clock-in | One tap | High (stops buddy-punching) | Off by default. ~30 KB per photo, supervisors only, deleted after 90 days. |
-| **Roster** (optional) | Clock-ins are compared with the rostered shift | None | n/a (punctuality) | Off by default. Late arrivals are flagged, never blocked. |
+| **Roster** (optional) | Clock-ins are compared with each person's working hours | None | n/a (punctuality) | Off by default. Records late arrivals, early leaves and no-shows. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
 **Default setup: GPS in "flag" mode plus the device check.** Nobody is ever blocked from clocking in, even when GPS is
@@ -113,20 +113,29 @@ For long-term records, download the monthly CSVs from **Export**.
 | `ROUND_MINUTES` | `15` | Round clock times to the nearest N minutes for pay; `0` turns rounding off |
 | `APP_NAME` | `Attendance` | Name shown in the menu bar and browser tab |
 
-### Roster and lateness
+### Roster and attendance record
 
-Turn on in **Settings → Roster and lateness**, then fill in the **Roster** page (one row per worker, one box per day:
-`10-15`, `10:00-15:00`, `6pm-11pm`, split shifts `10-14, 17-22`, past midnight `18:00-01:00`; blank = off).
-**Copy last week** fills a week from the previous one.
+For venues with fixed working hours that want a record of **late arrivals, early leaves and no-shows** (for warnings,
+separately from pay). Turn on in **Settings → Roster and lateness**, then:
+
+1. **Roster → Usual hours**: each person's normal week, set once (`10-22`, split shift `10-14, 17-22`,
+   past midnight `18:00-01:00`; blank = day off).
+2. **Roster → Week by week** (only when needed): change a particular day for leave, a swapped shift or extra hours.
+   Changed days are highlighted; putting a day back to the usual hours removes the change.
+3. **Attendance**: per month, each person's rostered shifts, attended, times late and minutes late, times left early
+   and minutes early, and no-shows, plus a list of every incident with rostered and actual times. Click a name for
+   one person's record. **CSV** downloads the incident list and the per-person totals.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | Compare clock-ins with the roster | Off | *Flag*: late / too early / not rostered are flagged. *Only allow during rostered shifts*: clocking in when not rostered, or too early, is refused. Being late is always allowed. |
-| Late after | 5 min | Minutes past the rostered start before a clock-in counts as late |
+| Grace period | 5 min | Arriving more than this after the start is late; leaving more than this before the end is early |
 | Clock-in opens | 30 min | How early before the rostered start a worker may clock in |
 
-Clocking back in after a break during the same rostered shift doesn't count as late again. With the roster on, the
-summary CSV gains *Times Late* and *Minutes Late* columns, and the detailed CSV gains the rostered start/end and minutes late.
+How it counts: lateness uses the first clock-in of a rostered shift and early leaving the last clock-out, so clocking
+out and in again for a break counts once. Times corrected by a supervisor are used. A shift with a missing clock-out
+isn't counted as leaving early. A no-show is a rostered shift that has ended without any clock-in; adding the shift
+manually links it to the roster. Pay and the monthly export are not affected.
 
 ### Short names
 
@@ -180,5 +189,6 @@ Code layout:
 - `src/verify.js`: geofence and IP checks
 - `src/device.js`: device identification
 - `src/schedule.js`: roster parsing and matching clock-ins to rostered shifts
+- `src/attendance.js`: the monthly attendance record (late, early, no-shows)
 - `src/cloudflare.js` and `src/node.js`: entry points
 - `public/`: CSS and small scripts

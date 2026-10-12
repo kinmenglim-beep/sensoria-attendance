@@ -408,12 +408,12 @@ test('roster: late, too early and not-rostered clock-ins', async () => {
   assert.match(r.text, /Late (20|21) min/);
   r = await sup('GET', `/admin/shifts/${shift.id - 1}`);
   assert.match(r.text, /Rostered/);
-  const ym = localDate().slice(0, 7);
-  r = await sup('GET', `/admin/export/summary.csv?month=${ym}`);
-  assert.match(r.text, /Times Late,Minutes Late/);
-  r = await sup('GET', `/admin/export/detail.csv?month=${ym}`);
-  assert.match(r.text, /Rostered Start,Rostered End,Minutes Late/);
-  assert.match(r.text, /Late (20|21) min; Left before rostered end/);
+  r = await sup('GET', '/admin/attendance');
+  assert.equal(r.status, 200);
+  assert.match(r.text, /Late arrivals/);
+  // The pay export is unchanged by the roster.
+  r = await sup('GET', `/admin/export/summary.csv?month=${localDate().slice(0, 7)}`);
+  assert.doesNotMatch(r.text, /Late/);
 });
 
 test('roster block mode only allows clock-in during rostered shifts', async () => {
@@ -439,37 +439,102 @@ test('roster block mode only allows clock-in during rostered shifts', async () =
   assert.equal((await db.get('SELECT flags FROM shifts')).flags, 'in:late');
 });
 
-test('roster page saves, validates and copies weeks', async () => {
-  const { sup, db, uid } = await restaurant({ schedule_mode: 'flag' });
-  const { weekStart } = await import('../src/schedule.js');
+test('usual hours apply every week; the week view stores only changes', async () => {
+  const { sup, wkr, db, uid } = await restaurant({ schedule_mode: 'flag' });
+  const { weekStart, effectiveRoster, OFF } = await import('../src/schedule.js');
   const { addDays } = await import('../src/time.js');
-  const week = weekStart(localDate());
-  let r = await sup('GET', `/admin/roster?week=${week}`);
-  assert.equal(r.status, 200);
-  assert.match(r.text, /href="\/admin\/roster"/); // menu link shown when roster checks are on
+  const usual = { [`u_${uid}_0`]: '10-22', [`u_${uid}_1`]: '', [`u_${uid}_2`]: '10-14, 17-22', [`u_${uid}_3`]: '10-22', [`u_${uid}_4`]: '10-22', [`u_${uid}_5`]: '10-22', [`u_${uid}_6`]: '10-22' };
 
-  r = await sup('POST', '/admin/roster', { form: { week, [`r_${uid}_${week}`]: '10-14, 5pm-10pm', [`r_${uid}_${addDays(week, 1)}`]: 'lunch' } });
+  let r = await sup('POST', '/admin/roster/usual', { form: { ...usual, [`u_${uid}_1`]: 'lunch' } });
   assert.equal(r.status, 400);
-  assert.match(r.text, /“lunch” isn&#39;t a time range/);
-  assert.match(r.text, /value="10-14, 5pm-10pm"/); // keeps what was typed
-  assert.equal((await db.get('SELECT COUNT(*) AS n FROM roster')).n, 0);
-
-  r = await sup('POST', '/admin/roster', { form: { week, [`r_${uid}_${week}`]: '10-14, 5pm-10pm', [`r_${uid}_${addDays(week, 1)}`]: '18:00-01:00' } });
+  assert.match(r.text, /Tue: “lunch” isn&#39;t a time range/);
+  r = await sup('POST', '/admin/roster/usual', { form: usual });
   assert.equal(r.status, 302);
-  const rows = await db.all('SELECT work_date, start_time, end_time FROM roster ORDER BY work_date, start_time');
-  assert.deepEqual(rows, [
-    { work_date: week, start_time: '10:00', end_time: '14:00' },
-    { work_date: week, start_time: '17:00', end_time: '22:00' },
-    { work_date: addDays(week, 1), start_time: '18:00', end_time: '01:00' },
-  ]);
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM usual_hours')).n, 7); // Wed is a split shift, Tue off
+
+  // Any week, past or future, shows the usual hours.
+  const week = addDays(weekStart(localDate()), 14);
   r = await sup('GET', `/admin/roster?week=${week}`);
-  assert.match(r.text, /value="10:00-14:00, 17:00-22:00"/);
+  assert.match(r.text, new RegExp(`name="r_${uid}_${week}" value="10:00-22:00"`));
+  assert.match(r.text, new RegExp(`name="r_${uid}_${addDays(week, 2)}" value="10:00-14:00, 17:00-22:00"`));
+  assert.match(r.text, /href="\/admin\/attendance"/); // menu links shown when roster checks are on
 
-  const next = addDays(week, 7);
-  r = await sup('POST', '/admin/roster/copy', { form: { week: next } });
+  // Leave on Monday, extra shift on Tuesday; the other days are left as usual and store nothing.
+  const form = { week };
+  for (let i = 0; i < 7; i++) form[`r_${uid}_${addDays(week, i)}`] = ['10-22', '', '10:00-14:00, 17:00-22:00', '10-22', '10-22', '10-22', '10-22'][i];
+  form[`r_${uid}_${week}`] = '';
+  form[`r_${uid}_${addDays(week, 1)}`] = '12-20';
+  r = await sup('POST', '/admin/roster', { form });
   assert.equal(r.status, 302);
-  assert.equal((await db.get('SELECT COUNT(*) AS n FROM roster WHERE work_date >= ?', next)).n, 3);
-  assert.equal((await db.get('SELECT work_date FROM roster WHERE start_time = ? ORDER BY work_date DESC', '18:00')).work_date, addDays(week, 8));
+  assert.deepEqual(await db.all('SELECT work_date, start_time, end_time FROM roster ORDER BY work_date'), [
+    { work_date: week, start_time: OFF, end_time: OFF },
+    { work_date: addDays(week, 1), start_time: '12:00', end_time: '20:00' },
+  ]);
+  const eff = await effectiveRoster(db, week, addDays(week, 6));
+  assert.equal(eff.filter((x) => x.work_date === week).length, 0);
+  assert.equal(eff.find((x) => x.work_date === addDays(week, 1)).start_time, '12:00');
+  assert.equal(eff.filter((x) => x.work_date === addDays(week, 2)).length, 2);
+  r = await sup('GET', `/admin/roster?week=${week}`);
+  assert.match(r.text, new RegExp(`class=" override"><input name="r_${uid}_${week}" value=""`));
+
+  // Putting Monday back to the usual hours removes the change.
+  r = await sup('POST', '/admin/roster', { form: { ...form, [`r_${uid}_${week}`]: '10:00-22:00' } });
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM roster WHERE work_date = ?', week)).n, 0);
+
+  // Workers see their usual hours on their phone.
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  r = await wkr('GET', '/');
+  assert.match(r.text, /My roster/);
+  assert.match(r.text, /10:00–14:00, 17:00–22:00|10:00–22:00|<span class="muted">Off<\/span>/);
+});
+
+test('attendance record: late arrivals, early leaves and no-shows', async () => {
+  const { sup, db, uid } = await restaurant({ schedule_mode: 'flag', late_grace_min: '5' });
+  await sup('POST', '/admin/people', { form: { name: 'Siti', login: '0198887777', short_name: 'SITI', role: 'worker', secret: '5678' } });
+  const siti = (await db.get("SELECT id FROM users WHERE short_name = 'SITI'")).id;
+  const { addDays, localToUtcIso } = await import('../src/time.js');
+  const { slotTimes } = await import('../src/schedule.js');
+  const day = addDays(localDate(), -2);
+  const at = (hhmm) => localToUtcIso(day, hhmm);
+  const roster = (user, start, end) => db.run('INSERT INTO roster (user_id, work_date, start_time, end_time) VALUES (?, ?, ?, ?)', user, day, start, end);
+  await roster(uid, '10:00', '14:00');
+  await roster(uid, '17:00', '22:00');
+  await roster(siti, '09:00', '17:00');
+  const shift = async (inT, outT, start, end) => {
+    const t = slotTimes(day, start, end);
+    await db.run('INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, sched_start, sched_end) VALUES (?, ?, ?, ?, ?, ?)',
+      uid, day, at(inT), at(outT), t.startIso, t.endIso);
+  };
+  // Lunch: 12 min late, a break, then left 20 min early. Dinner: on time (within the grace period).
+  await shift('10:12', '12:00', '10:00', '14:00');
+  await shift('12:30', '13:40', '10:00', '14:00');
+  await shift('17:04', '21:57', '17:00', '22:00');
+
+  const ym = day.slice(0, 7);
+  let r = await sup('GET', `/admin/attendance?month=${ym}`);
+  assert.equal(r.status, 200);
+  assert.match(r.text, /No-show/);
+  assert.match(r.text, /in 10:12/);
+  assert.match(r.text, /out 13:40/);
+  r = await sup('GET', `/admin/attendance.csv?month=${ym}`);
+  const lines = r.text.replace(/^\uFEFF/, '').trim().split('\r\n');
+  assert.ok(lines.includes(`${day},${lines.find((l) => l.startsWith(day)).split(',')[1]},Lim Kin Meng,KML,Late,10:00,14:00,10:12,12,${(await db.get('SELECT MIN(id) AS id FROM shifts')).id}`), lines.join('\n'));
+  assert.ok(lines.some((l) => l.includes('Lim Kin Meng,KML,Left early,10:00,14:00,13:40,20,')));
+  assert.ok(lines.some((l) => l.includes('Siti,SITI,No-show,09:00,17:00,,,')));
+  assert.ok(lines.includes('Lim Kin Meng,KML,2,2,1,12,1,20,0'), lines.join('\n'));
+  assert.ok(lines.includes('Siti,SITI,1,0,0,0,0,0,1'), lines.join('\n'));
+
+  // One person's record.
+  r = await sup('GET', `/admin/attendance?month=${ym}&user=${siti}`);
+  assert.match(r.text, /Attendance <span class="muted">· Siti/);
+  assert.doesNotMatch(r.text, /Lim Kin Meng/);
+
+  // A shift added by the supervisor for someone who forgot to clock in is linked to the roster.
+  r = await sup('POST', '/admin/shifts/new', { form: { user_id: String(siti), work_date: day, in_time: '09:30', out_time: '17:00' } });
+  assert.equal(r.status, 302);
+  r = await sup('GET', `/admin/attendance.csv?month=${ym}`);
+  assert.match(r.text, /Siti,SITI,Late,09:00,17:00,09:30,30,/);
+  assert.match(r.text, /Siti,SITI,1,1,1,30,0,0,0/);
 });
 
 test('selfie: required, stored with the shift and shown to supervisors only', async () => {

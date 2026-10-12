@@ -14,7 +14,8 @@
     // Name shown in the menu bar and browser tab.
     "APP_NAME": "Restaurant Attendance",
     "APP_TZ": "Asia/Kuala_Lumpur",
-    "ROUND_MINUTES": "15"
+    // Attendance record, not payroll: show the real clock times, unrounded.
+    "ROUND_MINUTES": "0"
   },
   "observability": { "enabled": true }
 }

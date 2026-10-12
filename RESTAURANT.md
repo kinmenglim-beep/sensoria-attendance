@@ -19,13 +19,15 @@ happened (no rounding).
 
 ## 1. Deploy (once, about 10 minutes, free)
 
-0. Make sure these changes are on the `main` branch on GitHub (Cloudflare deploys from `main`). Merging them also
-   updates the other venue's app; everything new there is off by default, so it keeps working as before.
+0. Make sure these changes are merged into `claude/gig-worker-checkin-system-dmyys6`, the repository's main branch,
+   which Cloudflare deploys from. Merging them also updates the other venue's app; everything new there is off by
+   default, so it keeps working as before.
 1. In the Cloudflare dashboard (the same account is fine): **Workers & Pages → Create → Import a repository** and pick
    `sensoria-attendance` again.
 2. On the setup screen:
    - Project name: **`restaurant-attendance`** (it must match `name` in `wrangler.restaurant.jsonc`).
    - **Deploy command:** `npx wrangler deploy --config wrangler.restaurant.jsonc`
+   - **Production branch** (if asked, under advanced settings): `claude/gig-worker-checkin-system-dmyys6`
 3. Click **Deploy**. The first deploy creates the restaurant's own database. The link looks like
    `https://restaurant-attendance.<your-name>.workers.dev`.
 4. Optional: change the name shown in the app by editing `APP_NAME` in `wrangler.restaurant.jsonc` (e.g. your

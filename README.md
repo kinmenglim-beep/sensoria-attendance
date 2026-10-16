@@ -42,6 +42,10 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 | **Attendance record** (optional) | Clock-ins are compared with the working hours | None | n/a (punctuality) | Off by default. Records late arrivals, early leaves and extra days off. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
+**GPS modes** (Settings → GPS location): *flag* records the location and flags a missing one or one outside every work
+site; *location required* refuses to clock in/out without a location (the phone shows how to switch it on) but only
+flags one outside; *must be at a work site* also refuses clock-ins from outside.
+
 **Default setup: GPS in "flag" mode plus the device check.** Nobody is ever blocked from clocking in, even when GPS is
 flaky indoors. Anything unusual is flagged so the supervisor can review it before approving. If people start abusing
 it, switch GPS to "block" or the phone check to "only allow the registered phone" in Settings.
@@ -135,6 +139,15 @@ How it counts: lateness uses the first clock-in of the day (or of each block of 
 last clock-out, so clocking out and in for a break counts once. Times corrected by a supervisor are used, and a
 forgotten clock-in can be added as a manual shift so the day counts as worked. A shift with a missing clock-out isn't
 counted as leaving early. Pay and the monthly export are not affected.
+
+### Several outlets
+
+Add each outlet as a **work site** in Settings (e.g. "PJ" and "KL"). Staff aren't tied to one outlet: each clock-in is
+filed under the nearest outlet by GPS. With two or more outlets, the **Dashboard**, **Attendance** and **Export** pages
+get an *All outlets | PJ | KL* switch, and every CSV can be downloaded for one outlet or all of them. An outlet can have
+its own working hours (Settings → Work sites); a person's own hours still come first. Days off and extra days off are
+about the person, so they are shown under *All outlets*. GPS must be on (Settings → GPS location) for outlets to be
+recorded; a shift added by hand lets you pick the outlet.
 
 ### Short names
 

@@ -39,7 +39,9 @@ If the first deploy fails with a database error, create a D1 database called `os
 
 1. Open `<link>/setup` and create the manager account.
 2. **Settings**, recommended for the restaurant:
-   - **GPS location**: *Record location, flag if outside a work site*. Switch to *Must be at a work site* if needed.
+   - **GPS location**: *Location required to clock in/out; flag if outside a work site*. Staff can't clock in with
+     location off; the phone tells them how to turn it on. (*Must be at a work site* is stricter: it also refuses
+     clock-ins from outside, which can catch people standing at the door when indoor GPS is off.)
    - **Phone check**: *Only allow the worker's registered phone*. A worker's first phone is registered automatically,
      so a colleague who signs in as them on their own phone can't clock in for them.
    - **Selfie at clock-in**: *Ask for a selfie; flag if skipped*, or *Selfie required*.
@@ -51,6 +53,14 @@ If the first deploy fails with a database error, create a D1 database called `os
    4-digit **PIN**. Only if someone works different hours (e.g. evenings only), fill in their **Working hours**.
 
 That's all. Nothing needs updating week to week.
+
+## More than one outlet
+
+Add each outlet under **Settings → Work sites** (stand inside it, tap **Use my current location**, name it e.g. `PJ`,
+then do the same at `KL`). Same app, same staff, same login. Staff clock in wherever they are working that day and the
+shift is filed under that outlet. The Dashboard, Attendance and Export pages then have an *All outlets | PJ | KL*
+switch, and the CSVs can be downloaded per outlet. If an outlet keeps different hours, type them next to it under
+Work sites.
 
 ## 3. What staff do
 

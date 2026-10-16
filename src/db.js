@@ -32,13 +32,15 @@ const SCHEMA = [
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
-  // Work locations used for the GPS geofence check.
+  // Work locations (outlets) used for the GPS geofence check; each clock-in is filed under
+  // the nearest one. work_hours: the outlet's working hours if different from everyone's.
   `CREATE TABLE IF NOT EXISTS sites (
-    id       INTEGER PRIMARY KEY,
-    name     TEXT NOT NULL,
-    lat      REAL NOT NULL,
-    lng      REAL NOT NULL,
-    radius_m INTEGER NOT NULL DEFAULT 150
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    lat        REAL NOT NULL,
+    lng        REAL NOT NULL,
+    radius_m   INTEGER NOT NULL DEFAULT 150,
+    work_hours TEXT
   )`,
   // Browsers/phones used to clock in, identified by a random long-lived key.
   `CREATE TABLE IF NOT EXISTS devices (
@@ -111,6 +113,7 @@ const SCHEMA = [
 const ADDED_COLUMNS = [
   ['users', 'short_name', 'TEXT COLLATE NOCASE'],
   ['users', 'work_hours', 'TEXT'],
+  ['sites', 'work_hours', 'TEXT'],
   ['shifts', 'sched_start', 'TEXT'],
   ['shifts', 'sched_end', 'TEXT'],
 ];

@@ -49,8 +49,20 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
   const activeWorkers = (db) => db.all("SELECT id, name, work_hours, created_at FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
 
+  // ---------- Outlets: the work sites; each clock-in is filed under the nearest one ----------
+  const outletList = async (db) => (await db.all('SELECT DISTINCT name FROM sites ORDER BY name COLLATE NOCASE')).map((r) => r.name);
+  const outletParam = (q, list) => (typeof q === 'string' && list.includes(q) ? q : null);
+  /** "All outlets | PJ | KL" switch, shown once there are two or more outlets. */
+  function outletTabs(list, current, href) {
+    if (list.length < 2) return '';
+    const tab = (value, label) => html`<a class="${current === value ? 'active' : ''}" href="${href(value)}">${label}</a>`;
+    return html`<nav class="tabs" aria-label="Outlet">${tab(null, 'All outlets')}${list.map((o) => tab(o, o))}</nav>`;
+  }
+  const fileSafe = (name) => name.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'outlet';
+  const withOutlet = (url, outlet) => (outlet ? `${url}${url.includes('?') ? '&' : '?'}outlet=${encodeURIComponent(outlet)}` : url);
+
   /** Table of shifts with optional checkboxes for bulk approval. */
-  function shiftTable(shifts, { showDate = false, back = '/admin' } = {}) {
+  function shiftTable(shifts, { showDate = false, back = '/admin', showOutlet = false } = {}) {
     const selectable = shifts.some((s) => s.status === 'pending' && approvable(s));
     return html`
       <form method="post" action="/admin/shifts/approve" class="approve-form">
@@ -61,7 +73,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <tr>
                 <th class="check">${selectable ? html`<input type="checkbox" data-select-all aria-label="Select all">` : ''}</th>
                 ${showDate ? html`<th>Date</th>` : ''}
-                <th>Worker</th><th>In</th><th>Out</th><th class="num">Hours</th><th>Checks</th><th>Status</th><th></th>
+                <th>Worker</th>${showOutlet ? html`<th>Outlet</th>` : ''}<th>In</th><th>Out</th><th class="num">Hours</th><th>Checks</th><th>Status</th><th></th>
               </tr>
             </thead>
             <tbody>
@@ -70,6 +82,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
                   <td class="check">${s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
                   ${showDate ? html`<td>${prettyDate(s.work_date)}</td>` : ''}
                   <td>${s.name}${s.in_device_label ? html`<div class="muted small">📱 ${deviceName(s.in_device_label, s.in_device_key)}</div>` : ''}</td>
+                  ${showOutlet ? html`<td>${s.in_site || html`<span class="muted">—</span>`}</td>` : ''}
                   <td>${clockTime(s.check_in_at)}</td>
                   <td>${s.check_out_at ? clockTime(s.check_out_at) : html`<span class="muted">${formatDuration(Date.now() - Date.parse(s.check_in_at))} so far</span>`}${s.check_out_at && localDate(s.check_out_at) !== s.work_date ? html` <small class="muted">(+1)</small>` : ''}</td>
                   <td class="num">${s.check_out_at ? fmtHours(shiftHours(s)) : '—'}</td>
@@ -94,12 +107,15 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const today = localDate();
     const q = c.req.query('date');
     const date = isDate(q) ? q : today;
+    const outlets = await outletList(db);
+    const outlet = outletParam(c.req.query('outlet'), outlets);
     const workers = await activeWorkers(db);
+    // In one outlet's view: only the shifts clocked in there.
     const shifts = await db.all(`
       SELECT s.*, u.name, r.name AS reviewer_name, ${DEVICE_COLUMNS} FROM shifts s
       JOIN users u ON u.id = s.user_id LEFT JOIN users r ON r.id = s.reviewed_by ${DEVICE_JOINS}
-      WHERE s.work_date = ? ORDER BY s.check_in_at
-    `, date);
+      WHERE s.work_date = ?${outlet ? ' AND s.in_site = ?' : ''} ORDER BY s.check_in_at
+    `, date, ...(outlet ? [outlet] : []));
 
     const byUser = new Map();
     for (const s of shifts) {
@@ -112,8 +128,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     for (const w of workers) {
       const list = byUser.get(w.id) || [];
       const open = list.find((s) => !s.check_out_at);
-      if (!list.length) absent.push(w);
-      else if (open) working.push({ w, open });
+      if (!list.length) { if (!outlet) absent.push(w); } else if (open) working.push({ w, open });
       else done.push({ w, hours: list.reduce((a, s) => a + shiftHours(s), 0), last: list[list.length - 1].check_out_at });
     }
     const pendingCount = shifts.filter((s) => s.check_out_at && s.status === 'pending').length;
@@ -122,7 +137,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       WHERE s.check_out_at IS NULL AND s.work_date < ? ORDER BY s.check_in_at
     `, today);
     const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
-    const back = `/admin?date=${date}`;
+    const back = withOutlet(`/admin?date=${date}`, outlet);
+    const dayUrl = (d) => withOutlet(`/admin?date=${d}`, outlet);
     const graceMs = (Number(settings.late_grace_min) || 0) * 60000;
     const allowance = Number(settings.days_off_per_week) || 0;
     // Days off each absent person already took earlier this week.
@@ -163,17 +179,19 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <div class="row-between page-head">
           <h1>${date === today ? 'Today' : prettyDate(date)}</h1>
           <form method="get" action="/admin" class="date-nav">
-            <a class="btn btn-small" href="/admin?date=${addDays(date, -1)}" aria-label="Previous day">‹</a>
+            <a class="btn btn-small" href="${dayUrl(addDays(date, -1))}" aria-label="Previous day">‹</a>
             <input type="date" name="date" value="${date}" data-autosubmit>
-            <a class="btn btn-small" href="/admin?date=${addDays(date, 1)}" aria-label="Next day">›</a>
-            ${date !== today ? html`<a class="btn btn-small" href="/admin">Today</a>` : ''}
+            ${outlet ? html`<input type="hidden" name="outlet" value="${outlet}">` : ''}
+            <a class="btn btn-small" href="${dayUrl(addDays(date, 1))}" aria-label="Next day">›</a>
+            ${date !== today ? html`<a class="btn btn-small" href="${withOutlet('/admin', outlet)}">Today</a>` : ''}
           </form>
         </div>
+        ${outletTabs(outlets, outlet, (o) => withOutlet(`/admin?date=${date}`, o))}
 
         <div class="stats">
           <div class="stat stat-blue"><span class="stat-num">${working.length}</span><span class="stat-label">Working now</span></div>
           <div class="stat stat-green"><span class="stat-num">${done.length}</span><span class="stat-label">Clocked out</span></div>
-          <div class="stat stat-grey"><span class="stat-num">${absent.length}</span><span class="stat-label">Not clocked in</span></div>
+          <div class="stat stat-grey"><span class="stat-num">${outlet ? '—' : absent.length}</span><span class="stat-label">Not clocked in${outlet ? ' (see All outlets)' : ''}</span></div>
           <div class="stat stat-amber"><span class="stat-num">${pendingCount}</span><span class="stat-label">To approve</span></div>
         </div>
 
@@ -199,21 +217,22 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <div class="alert alert-info">${otherPending} completed shift${otherPending > 1 ? 's' : ''} on other days still waiting for approval. <a href="/admin/pending">Review →</a></div>` : ''}
 
         <section class="card">
-          <h2>Check-ins ${date === today ? 'today' : 'on this day'}</h2>
-          ${shifts.length ? shiftTable(shifts, { back }) : html`<p class="muted">No check-ins yet.</p>`}
+          <h2>Check-ins ${date === today ? 'today' : 'on this day'}${outlet ? ` at ${outlet}` : ''}</h2>
+          ${shifts.length ? shiftTable(shifts, { back, showOutlet: !outlet && outlets.length > 1 }) : html`<p class="muted">No check-ins yet.</p>`}
         </section>
 
         <section class="roster">
           <div class="card">
-            <h2>Not clocked in <span class="count">${absent.length}</span></h2>
-            ${absent.length ? html`<ul class="people-list">
+            <h2>Not clocked in <span class="count">${outlet ? '' : absent.length}</span></h2>
+            ${outlet ? html`<p class="muted">Staff aren't tied to one outlet, so see <a href="/admin?date=${date}">All outlets</a> for who hasn't clocked in anywhere.</p>`
+              : absent.length ? html`<ul class="people-list">
               ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
             </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
           </div>
           <div class="card">
             <h2>Working now <span class="count">${working.length}</span></h2>
             ${working.length ? html`<ul class="people-list">
-              ${working.map(({ w, open }) => html`<li><span>${w.name}</span><span class="muted">since ${localTime(open.check_in_at)} · ${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></li>`)}
+              ${working.map(({ w, open }) => html`<li><span>${w.name}</span><span class="muted">${!outlet && outlets.length > 1 && open.in_site ? `${open.in_site} · ` : ''}since ${localTime(open.check_in_at)} · ${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></li>`)}
             </ul>` : html`<p class="muted">Nobody is clocked in.</p>`}
           </div>
           <div class="card">
@@ -307,13 +326,19 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   });
 
   // ---------- Shift detail + edit ----------
-  function shiftForm({ action, shift = null, workers = null, values, submitLabel }) {
+  function shiftForm({ action, shift = null, workers = null, outlets = [], values, submitLabel }) {
     return html`
       <form method="post" action="${action}" class="stack">
         ${workers ? html`
           <label>Worker
             <select name="user_id" required>
               ${workers.map((w) => html`<option value="${w.id}" ${String(w.id) === String(values.user_id) ? 'selected' : ''}>${w.name}</option>`)}
+            </select>
+          </label>` : ''}
+        ${outlets.length ? html`
+          <label>Outlet
+            <select name="outlet">
+              ${outlets.map((o) => html`<option value="${o}" ${o === values.outlet ? 'selected' : ''}>${o}</option>`)}
             </select>
           </label>` : ''}
         <div class="grid-3">
@@ -351,6 +376,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
   app.get('/admin/shifts/new', async (c) => {
     const workers = await activeWorkers(c.get('db'));
+    const outlets = await outletList(c.get('db'));
     const qDate = c.req.query('date');
     return render(c, {
       title: 'Add shift',
@@ -361,7 +387,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           ${shiftForm({
             action: '/admin/shifts/new',
             workers,
-            values: { user_id: c.req.query('user_id'), work_date: isDate(qDate) ? qDate : localDate(), in_time: '', out_time: '', approve: true },
+            outlets,
+            values: { user_id: c.req.query('user_id'), outlet: c.req.query('outlet'), work_date: isDate(qDate) ? qDate : localDate(), in_time: '', out_time: '', approve: true },
             submitLabel: 'Add shift',
           })}
         </section>`,
@@ -373,25 +400,28 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const b = await form(c);
     const worker = await db.get("SELECT id FROM users WHERE id = ? AND role = 'worker'", Number(b.user_id));
     const t = parseShiftTimes(b, { requireOut: true });
+    const outlets = await outletList(db);
     if (!worker || t.error) {
       const workers = await activeWorkers(db);
       return render(c, {
         title: 'Add shift',
         error: t.error || 'Choose a worker.',
         body: html`<div class="page-head"><h1>Add a shift manually</h1></div>
-          <section class="card">${shiftForm({ action: '/admin/shifts/new', workers, values: b, submitLabel: 'Add shift' })}</section>`,
+          <section class="card">${shiftForm({ action: '/admin/shifts/new', workers, outlets, values: b, submitLabel: 'Add shift' })}</section>`,
       }, 400);
     }
+    const outlet = outletParam(b.outlet, outlets) ?? (outlets.length === 1 ? outlets[0] : null);
+    const site = outlet ? await db.get('SELECT * FROM sites WHERE name = ? LIMIT 1', outlet) : null;
     const approve = b.approve === '1';
     const userId = c.get('user').id;
     const now = new Date().toISOString();
     // Link it to the working hours it overlaps, like a normal clock-in.
-    const hours = workRanges(await db.get('SELECT work_hours FROM users WHERE id = ?', worker.id), await getSettings(db));
+    const hours = workRanges(await db.get('SELECT work_hours FROM users WHERE id = ?', worker.id), await getSettings(db), site);
     const slot = [...daySlots(hours, addDays(t.date, -1)), ...daySlots(hours, t.date)].find((x) => t.inIso < x.endIso && t.outIso > x.startIso);
     const { lastId: id } = await db.run(`
-      INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, sched_start, sched_end, flags, status, reviewed_by, reviewed_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)
-    `, worker.id, t.date, t.inIso, t.outIso, slot?.startIso ?? null, slot?.endIso ?? null,
+      INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, in_site, sched_start, sched_end, flags, status, reviewed_by, reviewed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)
+    `, worker.id, t.date, t.inIso, t.outIso, outlet, slot?.startIso ?? null, slot?.endIso ?? null,
     approve ? 'approved' : 'pending', approve ? userId : null, approve ? now : null);
     await db.batch([
       auditStmt(id, userId, 'manual_add', String(b.reason || '').slice(0, 300) || null),
@@ -830,52 +860,60 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     const db = c.get('db');
     const ym = monthParam(c.req.query('month'));
     const uid = Number(c.req.query('user')) || null;
+    const outlets = await outletList(db);
+    const outlet = outletParam(c.req.query('outlet'), outlets);
     const settings = await getSettings(db);
-    return { ym, uid, settings, ...(await attendanceReport(db, ym, settings, { userId: uid })) };
+    const site = outlet ? await db.get('SELECT * FROM sites WHERE name = ? LIMIT 1', outlet) : null;
+    return { ym, uid, outlets, outlet, site, settings, ...(await attendanceReport(db, ym, settings, { userId: uid, outlet })) };
   }
 
   app.get('/admin/attendance', async (c) => {
-    const { ym, uid, settings, rows, incidents, totals } = await attendanceData(c);
-    const q = (month) => `/admin/attendance?month=${month}${uid ? `&user=${uid}` : ''}`;
+    const { ym, uid, outlets, outlet, site, settings, rows, incidents, totals } = await attendanceData(c);
+    const page = (month, o = outlet, user = uid) => withOutlet(`/admin/attendance?month=${month}${user ? `&user=${user}` : ''}`, o);
+    const q = (month) => page(month);
+    const showOutlet = !outlet && outlets.length > 1;
     const person = uid && rows[0] ? rows[0].worker : null;
     const grace = Number(settings.late_grace_min) || 0;
     const allowance = Number(settings.days_off_per_week) || 0;
-    const split = workRanges(null, settings).length > 1 || rows.some((r) => workRanges(r.worker, settings).length > 1);
+    const hoursOf = (w) => workRanges(w, settings, site);
+    const split = hoursOf(null).length > 1 || rows.some((r) => hoursOf(r.worker).length > 1);
     return render(c, {
       title: 'Attendance',
       active: 'attendance',
       body: html`
         <div class="row-between page-head">
-          <h1>Attendance${person ? html` <span class="muted">· ${person.name}</span>` : ''}</h1>
+          <h1>Attendance${person ? html` <span class="muted">· ${person.name}</span>` : ''}${outlet ? html` <span class="muted">· ${outlet}</span>` : ''}</h1>
           <div class="month-nav">
             <a class="btn btn-small" href="${q(addMonths(ym, -1))}">‹</a>
             <strong>${prettyMonth(ym)}</strong>
             <a class="btn btn-small" href="${q(addMonths(ym, 1))}">›</a>
           </div>
         </div>
+        ${outletTabs(outlets, outlet, (o) => page(ym, o))}
         ${settings.attendance_mode !== 'on' ? html`<div class="alert alert-warn">The attendance record is off. Turn it on and set the working hours in <a href="/admin/settings">Settings</a>.</div>` : ''}
         <div class="stats">
           <div class="stat stat-amber"><span class="stat-num">${totals.late}</span><span class="stat-label">Late arrivals${totals.lateMin ? html` · ${fmtMins(totals.lateMin)}` : ''}</span></div>
           <div class="stat stat-amber"><span class="stat-num">${totals.early}</span><span class="stat-label">Early leaves${totals.earlyMin ? html` · ${fmtMins(totals.earlyMin)}` : ''}</span></div>
-          <div class="stat stat-grey"><span class="stat-num">${totals.extraOff}</span><span class="stat-label">Extra days off</span></div>
+          <div class="stat stat-grey"><span class="stat-num">${outlet ? '—' : totals.extraOff}</span><span class="stat-label">Extra days off${outlet ? ' (see All outlets)' : ''}</span></div>
           <div class="stat stat-green"><span class="stat-num">${totals.worked}</span><span class="stat-label">Days worked</span></div>
         </div>
 
         <section class="card">
           <div class="row-between">
             <h2>${person ? 'Summary' : 'By person'}</h2>
-            <a class="btn btn-small" href="/admin/attendance.csv?month=${ym}${uid ? `&user=${uid}` : ''}">⬇ CSV</a>
+            <a class="btn btn-small" href="${withOutlet(`/admin/attendance.csv?month=${ym}${uid ? `&user=${uid}` : ''}`, outlet)}">⬇ CSV</a>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Name</th><th>Hours</th><th class="num">Days worked</th><th class="num">Days off</th><th class="num">Extra days off</th><th class="num">Late</th><th class="num">Mins late</th><th class="num">Left early</th><th class="num">Mins early</th>${split ? html`<th class="num">Missed shifts</th>` : ''}</tr></thead>
+              <thead><tr><th>Name</th><th>Hours</th><th class="num">Days worked</th>${outlet ? '' : html`<th class="num">Days off</th><th class="num">Extra days off</th>`}<th class="num">Late</th><th class="num">Mins late</th><th class="num">Left early</th><th class="num">Mins early</th>${split ? html`<th class="num">Missed shifts</th>` : ''}</tr></thead>
               <tbody>
                 ${rows.map((r) => html`
                   <tr>
-                    <td><a href="/admin/attendance?month=${ym}&user=${r.worker.id}">${r.worker.name}</a></td>
-                    <td class="muted small">${formatRanges(workRanges(r.worker, settings))}</td>
-                    <td class="num">${r.worked}</td><td class="num">${r.off}</td>
-                    <td class="num">${r.extraOff ? html`<strong class="flag">${r.extraOff}</strong>` : '—'}</td>
+                    <td><a href="${page(ym, outlet, r.worker.id)}">${r.worker.name}</a></td>
+                    <td class="muted small">${formatRanges(hoursOf(r.worker))}</td>
+                    <td class="num">${r.worked}</td>
+                    ${outlet ? '' : html`<td class="num">${r.off}</td>
+                    <td class="num">${r.extraOff ? html`<strong class="flag">${r.extraOff}</strong>` : '—'}</td>`}
                     <td class="num">${r.late ? html`<strong>${r.late}</strong>` : '—'}</td><td class="num">${r.lateMin ? fmtMins(r.lateMin) : '—'}</td>
                     <td class="num">${r.early ? html`<strong>${r.early}</strong>` : '—'}</td><td class="num">${r.earlyMin ? fmtMins(r.earlyMin) : '—'}</td>
                     ${split ? html`<td class="num">${r.missed || '—'}</td>` : ''}
@@ -883,7 +921,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               </tbody>
             </table>
           </div>
-          ${person ? html`<p><a href="/admin/attendance?month=${ym}">← Everyone</a></p>` : ''}
+          ${person ? html`<p><a href="${page(ym, outlet, null)}">← Everyone</a></p>` : ''}
+          ${outlet ? html`<p class="hint">Only what happened at ${outlet}: the days people clocked in here. Days off are about the person, not an outlet, so they are under All outlets.</p>` : ''}
           <p class="hint">A day without any clock-in is a day off. Each person may take ${allowance} day${allowance === 1 ? '' : 's'} off per week (Monday to Sunday);
             more than that counts as an <strong>extra day off</strong>. Late = clocked in more than ${grace} min after the start of their hours; left early = clocked out more than
             ${grace} min before the end. Clocking out and back in for a break counts once. Change these in <a href="/admin/settings">Settings</a>.</p>
@@ -894,12 +933,13 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           ${incidents.length ? html`
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Date</th>${person ? '' : html`<th>Name</th>`}<th>What</th><th>Hours</th><th>Actual</th><th class="num">By</th><th></th></tr></thead>
+                <thead><tr><th>Date</th>${person ? '' : html`<th>Name</th>`}${showOutlet ? html`<th>Outlet</th>` : ''}<th>What</th><th>Hours</th><th>Actual</th><th class="num">By</th><th></th></tr></thead>
                 <tbody>
                   ${incidents.map((x) => html`
                     <tr>
                       <td>${prettyDate(x.work_date)}</td>
                       ${person ? '' : html`<td>${x.name}</td>`}
+                      ${showOutlet ? html`<td>${x.outlet || html`<span class="muted">—</span>`}</td>` : ''}
                       <td><span class="${x.type === 'extra_off' || x.type === 'missed' ? 'badge badge-rejected' : 'flag'}">${INCIDENT[x.type]}</span></td>
                       <td>${x.schedStart ? `${localTime(x.schedStart)}–${localTime(x.schedEnd)}` : ''}</td>
                       <td>${x.actual ? `${x.type === 'late' ? 'in' : 'out'} ${localTime(x.actual)}` : html`<span class="muted">no clock-in</span>`}</td>
@@ -915,13 +955,13 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   });
 
   app.get('/admin/attendance.csv', async (c) => {
-    const { ym, uid, rows, incidents } = await attendanceData(c);
-    const out = [['Date', 'Day', 'Name', 'Short Name', 'What', 'Start', 'End', 'Actual Time', 'Minutes', 'Shift ID']];
+    const { ym, uid, outlet, rows, incidents } = await attendanceData(c);
+    const out = [['Date', 'Day', 'Name', 'Short Name', 'Outlet', 'What', 'Start', 'End', 'Actual Time', 'Minutes', 'Shift ID']];
     const short = new Map(rows.map((r) => [r.worker.id, r.worker.short_name || '']));
     for (const x of incidents) {
       out.push([
         x.work_date, new Date(`${x.work_date}T00:00:00Z`).toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' }),
-        x.name, short.get(x.user_id), INCIDENT[x.type], x.schedStart ? localTime(x.schedStart) : '', x.schedEnd ? localTime(x.schedEnd) : '',
+        x.name, short.get(x.user_id), x.outlet || '', INCIDENT[x.type], x.schedStart ? localTime(x.schedStart) : '', x.schedEnd ? localTime(x.schedEnd) : '',
         x.actual ? localTime(x.actual) : '', x.minutes ?? '', x.shiftId ?? '',
       ]);
     }
@@ -930,7 +970,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     for (const r of rows) {
       out.push([r.worker.name, r.worker.short_name || '', r.worked, r.off, r.extraOff, r.late, r.lateMin, r.early, r.earlyMin, r.missed]);
     }
-    return sendCsv(c, `attendance-record-${ym}${uid ? `-${uid}` : ''}.csv`, out);
+    return sendCsv(c, `attendance-record-${ym}${outlet ? `-${fileSafe(outlet)}` : ''}${uid ? `-${uid}` : ''}.csv`, out);
   });
 
   // ---------- Settings ----------
@@ -951,8 +991,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <form method="post" action="/admin/settings" class="stack">
             <label>GPS location
               <select name="geofence_mode">
-                ${opt('geofence_mode', 'flag', 'Record location, flag if outside a work site (recommended)')}
-                ${opt('geofence_mode', 'block', 'Must be at a work site to clock in/out')}
+                ${opt('geofence_mode', 'flag', 'Record location, flag if outside a work site or no location')}
+                ${opt('geofence_mode', 'require', 'Location required to clock in/out; flag if outside a work site (recommended)')}
+                ${opt('geofence_mode', 'block', 'Location required and must be at a work site to clock in/out')}
                 ${opt('geofence_mode', 'off', 'Off — don’t ask for location')}
               </select>
             </label>
@@ -1013,23 +1054,30 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         </section>
 
         <section class="card">
-          <h2>Work sites (GPS geofence)</h2>
+          <h2>Work sites / outlets (GPS geofence)</h2>
+          <p class="muted">Each clock-in is filed under the nearest site. With two or more outlets (e.g. PJ and KL), the Dashboard, Attendance and Export pages can show each one separately.</p>
           ${sites.length ? html`
             <div class="table-wrap"><table>
-              <thead><tr><th>Name</th><th>Location</th><th class="num">Radius</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Location</th><th class="num">Radius</th><th>Working hours</th><th></th></tr></thead>
               <tbody>${sites.map((x) => html`
                 <tr><td>${x.name}</td><td>${x.lat.toFixed(5)}, ${x.lng.toFixed(5)} ${mapLink(x.lat, x.lng)}</td><td class="num">${x.radius_m} m</td>
+                  <td><form method="post" action="/admin/sites/${x.id}/hours" class="inline-form">
+                    <input name="work_hours" value="${x.work_hours || ''}" maxlength="40" placeholder="Same as everyone" aria-label="Working hours at ${x.name}">
+                    <button class="btn btn-small" type="submit">Save</button>
+                  </form></td>
                   <td><form method="post" action="/admin/sites/${x.id}/delete"><button class="btn-link danger" type="submit" data-confirm="Remove this site?">Remove</button></form></td></tr>`)}
               </tbody></table></div>` : html`<p class="muted">No sites yet — locations are recorded but not checked against anywhere.</p>`}
           <h3>Add a site</h3>
           <form method="post" action="/admin/sites" class="stack" id="site-form">
             <div class="grid-4">
-              <label>Name <input name="name" required maxlength="100" placeholder="Main venue"></label>
+              <label>Name <input name="name" required maxlength="100" placeholder="e.g. PJ"></label>
               <label>Latitude <input name="lat" required inputmode="decimal" data-lat></label>
               <label>Longitude <input name="lng" required inputmode="decimal" data-lng></label>
               <label>Radius (m) <input name="radius_m" type="number" min="20" max="5000" value="150" required></label>
             </div>
-            <p class="hint">Stand at the venue and tap “Use my current location”, or copy the coordinates from Google Maps (right-click → the numbers at the top). 100–200 m works well; GPS indoors can be off by 50 m or more.</p>
+            <label>Working hours at this outlet (optional) <input name="work_hours" maxlength="40" placeholder="Same as everyone"></label>
+            <p class="hint">Stand at the venue and tap “Use my current location”, or copy the coordinates from Google Maps (right-click → the numbers at the top). 100–200 m works well; GPS indoors can be off by 50 m or more.
+              Working hours: only if this outlet's differ from everyone's, e.g. 11:00-23:00. A person's own hours (People) come first.</p>
             <div class="action-row">
               <button type="button" class="btn" data-use-location>Use my current location</button>
               <button class="btn btn-primary" type="submit">Add site</button>
@@ -1050,7 +1098,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       return v !== '' && n >= 0 && n <= max ? n : fallback;
     };
     await c.get('db').batch([
-      setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag')),
+      setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'require', 'block'], 'flag')),
       setSettingStmt('ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('allowed_ips', String(b.allowed_ips || '').slice(0, 2000)),
       setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),
@@ -1076,8 +1124,25 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     if (!name || !(Math.abs(lat) <= 90) || !(Math.abs(lng) <= 180) || !(radius >= 20 && radius <= 5000)) {
       return c.redirect(withMsg('/admin/settings', 'Could not add site: check the name, coordinates and radius.'));
     }
-    await c.get('db').run('INSERT INTO sites (name, lat, lng, radius_m) VALUES (?, ?, ?, ?)', name, lat, lng, radius);
+    const hours = siteHours(b.work_hours);
+    if (hours.error) return c.redirect(withMsg('/admin/settings', `Could not add site: working hours ${hours.error}`));
+    await c.get('db').run('INSERT INTO sites (name, lat, lng, radius_m, work_hours) VALUES (?, ?, ?, ?, ?)', name, lat, lng, radius, hours.value);
     return c.redirect(withMsg('/admin/settings', `Site “${name}” added.`));
+  });
+
+  /** Optional outlet working hours: blank = same as everyone's. Returns { value } or { error }. */
+  function siteHours(text) {
+    if (!String(text || '').trim()) return { value: null };
+    const parsed = parseRanges(text);
+    if (parsed.error || !parsed.ranges.length) return { error: parsed.error || 'should look like 10:00-22:00.' };
+    return { value: formatRanges(parsed.ranges) };
+  }
+
+  app.post('/admin/sites/:id/hours', async (c) => {
+    const hours = siteHours((await form(c)).work_hours);
+    if (hours.error) return c.redirect(withMsg('/admin/settings', `Working hours not saved: ${hours.error}`));
+    await c.get('db').run('UPDATE sites SET work_hours = ? WHERE id = ?', hours.value, Number(c.req.param('id')));
+    return c.redirect(withMsg('/admin/settings', 'Outlet working hours saved.'));
   });
 
   app.post('/admin/sites/:id/delete', async (c) => {
@@ -1093,21 +1158,31 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     return `${String(d).padStart(2, '0')} ${wd}`;
   };
 
-  app.get('/admin/export', async (c) => {
+  /** Month and optional outlet for the export pages; the report only covers that outlet's shifts. */
+  async function exportData(c) {
+    const db = c.get('db');
     const ym = monthParam(c.req.query('month'));
-    const rep = await monthReport(c.get('db'), ym);
+    const outlets = await outletList(db);
+    const outlet = outletParam(c.req.query('outlet'), outlets);
+    return { ym, outlets, outlet, rep: await monthReport(db, ym, { outlet }) };
+  }
+
+  app.get('/admin/export', async (c) => {
+    const { ym, outlets, outlet, rep } = await exportData(c);
+    const url = (path, month = ym, o = outlet) => withOutlet(`${path}?month=${month}`, o);
     return render(c, {
       title: 'Monthly export',
       active: 'export',
       body: html`
         <div class="row-between page-head">
-          <h1>Monthly summary</h1>
+          <h1>Monthly summary${outlet ? html` <span class="muted">· ${outlet}</span>` : ''}</h1>
           <div class="month-nav">
-            <a class="btn btn-small" href="/admin/export?month=${addMonths(ym, -1)}">‹</a>
+            <a class="btn btn-small" href="${url('/admin/export', addMonths(ym, -1))}">‹</a>
             <strong>${prettyMonth(ym)}</strong>
-            <a class="btn btn-small" href="/admin/export?month=${addMonths(ym, 1)}">›</a>
+            <a class="btn btn-small" href="${url('/admin/export', addMonths(ym, 1))}">›</a>
           </div>
         </div>
+        ${outletTabs(outlets, outlet, (o) => url('/admin/export', ym, o))}
 
         ${rep.totals.pending || rep.totals.open ? html`
           <div class="alert alert-warn">
@@ -1118,8 +1193,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
         <section class="card">
           <div class="action-row">
-            <a class="btn btn-primary" href="/admin/export/summary.csv?month=${ym}">⬇ Summary CSV (one row per worker)</a>
-            <a class="btn" href="/admin/export/detail.csv?month=${ym}">⬇ Detailed CSV (every shift, with approvals)</a>
+            <a class="btn btn-primary" href="${url('/admin/export/summary.csv')}">⬇ Summary CSV (one row per worker)</a>
+            <a class="btn" href="${url('/admin/export/detail.csv')}">⬇ Detailed CSV (every shift, with approvals)</a>
           </div>
           <p class="hint">The summary has each worker’s totals plus approved hours for every day of the month. The detailed file lists each check-in/out with who approved it and when.</p>
           <div class="table-wrap">
@@ -1157,8 +1232,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   }
 
   app.get('/admin/export/summary.csv', async (c) => {
-    const ym = monthParam(c.req.query('month'));
-    const rep = await monthReport(c.get('db'), ym);
+    const { ym, outlet, rep } = await exportData(c);
     const dayCols = Array.from({ length: rep.nDays }, (_, i) => dayLabel(ym, i + 1));
     const rows = [[
       'Month', 'Worker ID', 'Name', 'Phone / Staff ID', 'Days Worked', 'Shifts', 'Approved Hours', 'Pending Hours',
@@ -1172,12 +1246,11 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     }
     const t = rep.totals;
     rows.push([ym, '', 'TOTAL', '', t.daysWorked, t.shifts, t.approved, t.pending, t.rejected, t.open, '', t.pay, ...t.daily.map((h) => h || '')]);
-    return sendCsv(c, `attendance-summary-${ym}.csv`, rows);
+    return sendCsv(c, `attendance-summary-${ym}${outlet ? `-${fileSafe(outlet)}` : ''}.csv`, rows);
   });
 
   app.get('/admin/export/detail.csv', async (c) => {
-    const ym = monthParam(c.req.query('month'));
-    const rep = await monthReport(c.get('db'), ym);
+    const { ym, outlet, rep } = await exportData(c);
     const rows = [[
       'Date', 'Day', 'Worker ID', 'Name', 'Phone / Staff ID', 'Check In', 'Check Out',
       'Check In (rounded)', 'Check Out (rounded)', 'Hours', 'Actual Hours', 'Status',
@@ -1205,6 +1278,6 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         s.id,
       ]);
     }
-    return sendCsv(c, `attendance-detail-${ym}.csv`, rows);
+    return sendCsv(c, `attendance-detail-${ym}${outlet ? `-${fileSafe(outlet)}` : ''}.csv`, rows);
   });
 }

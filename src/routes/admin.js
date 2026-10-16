@@ -991,8 +991,9 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           <form method="post" action="/admin/settings" class="stack">
             <label>GPS location
               <select name="geofence_mode">
-                ${opt('geofence_mode', 'flag', 'Record location, flag if outside a work site (recommended)')}
-                ${opt('geofence_mode', 'block', 'Must be at a work site to clock in/out')}
+                ${opt('geofence_mode', 'flag', 'Record location, flag if outside a work site or no location')}
+                ${opt('geofence_mode', 'require', 'Location required to clock in/out; flag if outside a work site (recommended)')}
+                ${opt('geofence_mode', 'block', 'Location required and must be at a work site to clock in/out')}
                 ${opt('geofence_mode', 'off', 'Off — don’t ask for location')}
               </select>
             </label>
@@ -1097,7 +1098,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       return v !== '' && n >= 0 && n <= max ? n : fallback;
     };
     await c.get('db').batch([
-      setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'block'], 'flag')),
+      setSettingStmt('geofence_mode', pick(b.geofence_mode, ['off', 'flag', 'require', 'block'], 'flag')),
       setSettingStmt('ip_mode', pick(b.ip_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('allowed_ips', String(b.allowed_ips || '').slice(0, 2000)),
       setSettingStmt('device_mode', pick(b.device_mode, ['off', 'flag', 'block'], 'flag')),

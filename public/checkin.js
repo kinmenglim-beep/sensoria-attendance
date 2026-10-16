@@ -57,14 +57,24 @@
     });
   }
 
+  const isIos = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  // Step-by-step help for the two places location can be switched off: the phone, and this site.
+  function howToAllow() {
+    return isIos
+      ? 'On iPhone: open Settings → Privacy & Security → Location Services, turn it On, tap Safari Websites and choose "While Using the App". Then come back, reload this page and try again.'
+      : 'On Android: tap the icon to the left of the web address → Permissions (or Site settings) → Location → Allow. Then reload this page and try again.';
+  }
+  function howToTurnOn() {
+    return isIos
+      ? 'Make sure Location Services is On (Settings → Privacy & Security → Location Services), then try again.'
+      : 'Swipe down from the top of the screen and turn on Location, then try again.';
+  }
+
   function getPosition() {
     return new Promise((resolve, reject) => {
       if (!navigator.geolocation) return reject(new Error('This browser cannot share location.'));
       navigator.geolocation.getCurrentPosition(resolve, (err) => {
-        const msg = err.code === 1
-          ? 'Location permission was denied. Please allow location for this site in your browser settings.'
-          : 'Could not get your location. Make sure location (GPS) is turned on.';
-        reject(new Error(msg));
+        reject(new Error(err.code === 1 ? `Location is blocked for this site. ${howToAllow()}` : `Could not get your location. ${howToTurnOn()}`));
       }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 30000 });
     });
   }
@@ -104,7 +114,8 @@
           body.lng = pos.coords.longitude;
           body.accuracy = pos.coords.accuracy;
         } catch (err) {
-          if (form.dataset.location === 'block') throw err;
+          // Location required: stop here so they can turn it on.
+          if (form.dataset.location === 'block' || form.dataset.location === 'require') throw err;
           // In "flag" mode we still let them clock in; the supervisor sees a flag.
         }
       }

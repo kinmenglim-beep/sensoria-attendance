@@ -90,7 +90,9 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
               ${open ? 'Clock OUT' : 'Clock IN'}
             </button>
             <p class="form-status" data-form-status role="status" aria-live="polite"></p>
-            ${s.geofence_mode !== 'off' ? html`<p class="hint">Your location is recorded when you clock ${action}. Please allow location access if asked.</p>` : ''}
+            ${s.geofence_mode === 'require' || s.geofence_mode === 'block'
+              ? html`<p class="hint">Location is required to clock ${action}. Please turn on location and tap <strong>Allow</strong> if asked.</p>`
+              : s.geofence_mode !== 'off' ? html`<p class="hint">Your location is recorded when you clock ${action}. Please allow location access if asked.</p>` : ''}
           </form>
         </section>
 
@@ -141,13 +143,14 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
     const loc = { lat: null, lng: null, accuracy: null, site: null, distance: null };
     let siteRow = null; // the nearest outlet, for its working hours
 
-    // 1. GPS geofence
+    // 1. GPS geofence. "require" and "block" both refuse a clock in/out without a location;
+    // "block" also refuses one from outside every work site.
     if (s.geofence_mode !== 'off') {
       const lat = num(body.lat);
       const lng = num(body.lng);
       if (lat === null || lng === null || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
-        if (s.geofence_mode === 'block') {
-          return c.json({ error: 'Location is required. Please turn on location / allow access for this site and try again.' }, 400);
+        if (s.geofence_mode === 'block' || s.geofence_mode === 'require') {
+          return c.json({ error: 'Location is required. Please turn on location / allow access for this site and try again.', needLocation: true }, 400);
         }
         flags.push(`${p}:no_location`);
       } else {

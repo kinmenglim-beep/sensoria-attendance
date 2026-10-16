@@ -39,7 +39,9 @@ If the first deploy fails with a database error, create a D1 database called `os
 
 1. Open `<link>/setup` and create the manager account.
 2. **Settings**, recommended for the restaurant:
-   - **GPS location**: *Record location, flag if outside a work site*. Switch to *Must be at a work site* if needed.
+   - **GPS location**: *Location required to clock in/out; flag if outside a work site*. Staff can't clock in with
+     location off; the phone tells them how to turn it on. (*Must be at a work site* is stricter: it also refuses
+     clock-ins from outside, which can catch people standing at the door when indoor GPS is off.)
    - **Phone check**: *Only allow the worker's registered phone*. A worker's first phone is registered automatically,
      so a colleague who signs in as them on their own phone can't clock in for them.
    - **Selfie at clock-in**: *Ask for a selfie; flag if skipped*, or *Selfie required*.

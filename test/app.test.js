@@ -150,6 +150,30 @@ test('block mode rejects check-ins outside the geofence', async () => {
   assert.equal(r.status, 200);
 });
 
+test('require mode needs a location but only flags clock-ins outside the area', async () => {
+  const { client } = makeApp();
+  const sup = client();
+  const wkr = client();
+  await sup('POST', '/setup', { form: { name: 'S', login: 's', secret: 'password1' } });
+  await sup('POST', '/admin/people', { form: { name: 'W', login: 'w', role: 'worker', secret: '1111' } });
+  await sup('POST', '/admin/sites', { form: { name: 'Venue', lat: '3.139', lng: '101.6869', radius_m: '100' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'require', ip_mode: 'off', allowed_ips: '' } });
+  await wkr('POST', '/login', { form: { login: 'w', secret: '1111' } });
+  let r = await wkr('GET', '/');
+  assert.match(r.text, /data-location="require"/);
+  assert.match(r.text, /Location is required to clock in/);
+
+  r = await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  assert.equal(r.status, 400);
+  assert.match(r.text, /Location is required/);
+  r = await wkr('POST', '/api/clock', { json: { action: 'in', lat: 3.2, lng: 101.7, accuracy: 5 } });
+  assert.equal(r.status, 200, r.text);
+  r = await wkr('POST', '/api/clock', { json: { action: 'out' } });
+  assert.equal(r.status, 400); // clocking out needs a location too
+  r = await wkr('POST', '/api/clock', { json: { action: 'out', lat: 3.1391, lng: 101.6869, accuracy: 5 } });
+  assert.equal(r.status, 200, r.text);
+});
+
 test('login is locked after repeated failures', async () => {
   const { app, db, client } = makeApp();
   const c = client();

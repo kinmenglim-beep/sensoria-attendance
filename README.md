@@ -42,6 +42,10 @@ Supervisors approve shifts and see who is missing. Management downloads a monthl
 | **Attendance record** (optional) | Clock-ins are compared with the working hours | None | n/a (punctuality) | Off by default. Records late arrivals, early leaves and extra days off. |
 | **Venue WiFi** | Checks the venue's *public IP* | Must be on the WiFi | Medium–High | A browser can't read the WiFi name. This only works if the venue has a fixed IP, and it fails when a worker is on mobile data. |
 
+**GPS modes** (Settings → GPS location): *flag* records the location and flags a missing one or one outside every work
+site; *location required* refuses to clock in/out without a location (the phone shows how to switch it on) but only
+flags one outside; *must be at a work site* also refuses clock-ins from outside.
+
 **Default setup: GPS in "flag" mode plus the device check.** Nobody is ever blocked from clocking in, even when GPS is
 flaky indoors. Anything unusual is flagged so the supervisor can review it before approving. If people start abusing
 it, switch GPS to "block" or the phone check to "only allow the registered phone" in Settings.

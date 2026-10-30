@@ -48,6 +48,7 @@ If the first deploy fails with a database error, create a D1 database called `os
    - **Attendance record**: *On*. **Working hours** e.g. `10:00-22:00` (split shift: `10-14, 17-22`).
      **Days off allowed per week**: 1. **Grace period**: 5 min (arriving at 10:06 for 10:00 is late; leaving at 21:54
      for 22:00 is early).
+   - **Approvals**: *Off*. Shifts are approved automatically when staff clock out; you only look at problems.
    - **Work sites**: stand in the restaurant, tap **Use my current location**, then **Add site** (radius 100–150 m).
 3. **People**: add each staff member with their name, **phone number**, a **short name** (initials or nickname) and a
    4-digit **PIN**. Only if someone works different hours (e.g. evenings only), fill in their **Working hours**.
@@ -71,6 +72,9 @@ Work sites.
 
 ## What the manager sees
 
+- **Dashboard → Needs attention**: only today's problems (late, left early, no GPS, outside the outlet, wrong phone,
+  no selfie, a second day off this week, a forgotten clock-out). A green tick means there's nothing to look at.
+  Everything else is folded under *Everyone today*.
 - **Dashboard** (today, live): who is working, who hasn't come in yet, and a red flag on anyone missing today who
   **already had their day off this week**.
 - **Attendance** (per month): for each person, days worked, days off, **extra days off**, **times late / minutes late**

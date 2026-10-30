@@ -62,9 +62,11 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
   async function render(c, opts, status = 200) {
     const user = c.get('user');
     const flash = opts.flash !== undefined ? opts.flash : (c.req.query('ok') ?? null);
-    // The Attendance menu item only appears once the attendance record is switched on in Settings.
-    const attendance = user?.role === 'supervisor' && (await getSettings(c.get('db'))).attendance_mode === 'on';
-    return c.html(layout({ user, ...opts, flash, attendance }), status);
+    // Menu items that depend on Settings: Attendance once it's on, Approvals unless they're off.
+    const s = user?.role === 'supervisor' ? await getSettings(c.get('db')) : null;
+    const attendance = s?.attendance_mode === 'on';
+    const approvals = s ? s.approvals !== 'off' : true;
+    return c.html(layout({ user, ...opts, flash, attendance, approvals }), status);
   }
 
   /** Parsed form body; repeated fields (e.g. ids) come back as arrays. */

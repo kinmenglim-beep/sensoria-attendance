@@ -45,6 +45,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
   // Payable hours use check-in/out rounded to the nearest quarter hour.
   const shiftHours = (s) => (s.check_out_at ? paidHours(s.check_in_at, s.check_out_at) : null);
+  // With approvals off, shifts are approved automatically (at clock-out, or when a supervisor saves them).
+  const approvalsOn = async (db) => (await getSettings(db)).approvals !== 'off';
   // Auto-closed shifts need a real check-out time before they can be approved.
   const approvable = (s) => s.check_out_at && s.status !== 'approved' && !hasFlag(s.flags, 'no_checkout');
   const activeWorkers = (db) => db.all("SELECT id, name, work_hours, created_at FROM users WHERE role = 'worker' AND active = 1 ORDER BY name COLLATE NOCASE");
@@ -62,8 +64,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   const withOutlet = (url, outlet) => (outlet ? `${url}${url.includes('?') ? '&' : '?'}outlet=${encodeURIComponent(outlet)}` : url);
 
   /** Table of shifts with optional checkboxes for bulk approval. */
-  function shiftTable(shifts, { showDate = false, back = '/admin', showOutlet = false } = {}) {
-    const selectable = shifts.some((s) => s.status === 'pending' && approvable(s));
+  function shiftTable(shifts, { showDate = false, back = '/admin', showOutlet = false, approvals = true } = {}) {
+    const selectable = approvals && shifts.some((s) => s.status === 'pending' && approvable(s));
     return html`
       <form method="post" action="/admin/shifts/approve" class="approve-form">
         <input type="hidden" name="back" value="${back}">
@@ -79,7 +81,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             <tbody>
               ${shifts.map((s) => html`
                 <tr>
-                  <td class="check">${s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
+                  <td class="check">${selectable && s.status === 'pending' && approvable(s) ? html`<input type="checkbox" name="ids" value="${s.id}" aria-label="Select shift">` : ''}</td>
                   ${showDate ? html`<td>${prettyDate(s.work_date)}</td>` : ''}
                   <td>${s.name}${s.in_device_label ? html`<div class="muted small">📱 ${deviceName(s.in_device_label, s.in_device_key)}</div>` : ''}</td>
                   ${showOutlet ? html`<td>${s.in_site || html`<span class="muted">—</span>`}</td>` : ''}
@@ -132,9 +134,11 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       else done.push({ w, hours: list.reduce((a, s) => a + shiftHours(s), 0), last: list[list.length - 1].check_out_at });
     }
     const pendingCount = shifts.filter((s) => s.check_out_at && s.status === 'pending').length;
+    // Earlier days' shifts with no real clock-out yet: still open, or closed automatically at 0 h.
     const staleOpen = await db.all(`
       SELECT s.*, u.name FROM shifts s JOIN users u ON u.id = s.user_id
-      WHERE s.check_out_at IS NULL AND s.work_date < ? ORDER BY s.check_in_at
+      WHERE s.work_date < ? AND (s.check_out_at IS NULL OR (',' || s.flags || ',') LIKE '%,no_checkout,%')
+      ORDER BY s.check_in_at
     `, today);
     const otherPending = (await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL AND work_date <> ?", date)).n;
     const back = withOutlet(`/admin?date=${date}`, outlet);
@@ -172,6 +176,46 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       WHERE wd.status = 'pending' AND u.active = 1 ORDER BY wd.created_at
     `);
 
+    // "Needs attention": only what's wrong, so a quick look is enough.
+    const approvals = settings.approvals !== 'off';
+    const NOT_A_PROBLEM = ['manual', 'edited'];
+    const attention = [];
+    for (const s of shifts) {
+      const problems = String(s.flags || '').split(',').filter((f) => f && !NOT_A_PROBLEM.includes(f));
+      if (problems.length) {
+        attention.push({
+          name: s.name,
+          href: `/admin/shifts/${s.id}`,
+          what: problems.map((f) => flagLabel(f, { lateMin: minutesLate(s), earlyMin: minutesEarly(s) })).join(' · '),
+          where: !outlet && outlets.length > 1 ? s.in_site : null,
+        });
+      }
+    }
+    if (tracking && !outlet) {
+      for (const w of absent) {
+        const prev = offBefore(w);
+        const slots = daySlots(workRanges(w, settings), date);
+        const started = slots.length && Date.now() - Date.parse(slots[0].startIso) > graceMs;
+        if (prev >= allowance && started) {
+          attention.push({
+            name: w.name,
+            href: `/admin/attendance?month=${date.slice(0, 7)}&user=${w.id}`,
+            what: `Not in today${prev ? ` — already ${prev} day${prev === 1 ? '' : 's'} off this week` : ''}`,
+          });
+        }
+      }
+    }
+    const listed = new Set(shifts.map((s) => s.id));
+    for (const s of staleOpen.filter((x) => !listed.has(x.id))) {
+      attention.push({ name: s.name, href: `/admin/shifts/${s.id}`, what: `Never clocked out on ${prettyDate(s.work_date)} — enter the finish time` });
+    }
+    for (const w of deviceChangers) {
+      attention.push({ name: w.name, href: `/admin/people/${w.id}#devices`, what: `🚩 ${w.n} different phones in 30 days — someone else may be clocking in for them` });
+    }
+    for (const x of phonesToReview) {
+      attention.push({ name: x.name, href: `/admin/people/${x.user_id}#devices`, what: `New phone to review: ${deviceName(x.label, x.device_key)}` });
+    }
+
     return render(c, {
       title: 'Dashboard',
       active: 'dashboard',
@@ -188,60 +232,45 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         </div>
         ${outletTabs(outlets, outlet, (o) => withOutlet(`/admin?date=${date}`, o))}
 
-        <div class="stats">
-          <div class="stat stat-blue"><span class="stat-num">${working.length}</span><span class="stat-label">Working now</span></div>
-          <div class="stat stat-green"><span class="stat-num">${done.length}</span><span class="stat-label">Clocked out</span></div>
-          <div class="stat stat-grey"><span class="stat-num">${outlet ? '—' : absent.length}</span><span class="stat-label">Not clocked in${outlet ? ' (see All outlets)' : ''}</span></div>
-          <div class="stat stat-amber"><span class="stat-num">${pendingCount}</span><span class="stat-label">To approve</span></div>
-        </div>
-
-        ${staleOpen.length ? html`
-          <div class="alert alert-warn">
-            <strong>${staleOpen.length} worker${staleOpen.length > 1 ? 's' : ''} never clocked out on an earlier day:</strong>
-            ${staleOpen.map((s, i) => html`${i ? ', ' : ' '}<a href="/admin/shifts/${s.id}">${s.name} (${prettyDate(s.work_date)})</a>`)}.
-            Open the shift to enter the correct check-out time.
-          </div>` : ''}
-        ${deviceChangers.length ? html`
-          <div class="alert alert-error">
-            <strong>🚩 Frequent phone changes (last 30 days):</strong>
-            ${deviceChangers.map((w, i) => html`${i ? ', ' : ' '}<a href="/admin/people/${w.id}#devices">${w.name} (${w.n} phones)</a>`)}.
-            Someone else may be clocking in for them.
-          </div>` : ''}
-        ${phonesToReview.length ? html`
-          <div class="alert alert-warn">
-            <strong>📱 Unregistered phones to review:</strong>
-            ${phonesToReview.map((x, i) => html`${i ? ', ' : ' '}<a href="/admin/people/${x.user_id}#devices">${x.name} — ${deviceName(x.label, x.device_key)}</a>`)}.
-            Register it if the worker changed phone; otherwise check with them.
-          </div>` : ''}
-        ${otherPending ? html`
-          <div class="alert alert-info">${otherPending} completed shift${otherPending > 1 ? 's' : ''} on other days still waiting for approval. <a href="/admin/pending">Review →</a></div>` : ''}
-
-        <section class="card">
-          <h2>Check-ins ${date === today ? 'today' : 'on this day'}${outlet ? ` at ${outlet}` : ''}</h2>
-          ${shifts.length ? shiftTable(shifts, { back, showOutlet: !outlet && outlets.length > 1 }) : html`<p class="muted">No check-ins yet.</p>`}
+        <section class="card attention ${attention.length ? 'has-issues' : 'all-good'}">
+          <h2>${attention.length ? html`Needs attention <span class="count">${attention.length}</span>` : 'Nothing needs your attention ✓'}</h2>
+          ${attention.length ? html`<ul class="people-list">
+            ${attention.map((x) => html`<li><span><strong>${x.name}</strong>${x.where ? html` <span class="muted small">${x.where}</span>` : ''}<br><span class="small">${x.what}</span></span><a class="small" href="${x.href}">View</a></li>`)}
+          </ul>` : html`<p class="muted">Everyone who clocked in ${date === today ? 'today' : 'that day'} did so on time, at the outlet, on their own phone.</p>`}
         </section>
 
-        <section class="roster">
-          <div class="card">
-            <h2>Not clocked in <span class="count">${outlet ? '' : absent.length}</span></h2>
-            ${outlet ? html`<p class="muted">Staff aren't tied to one outlet, so see <a href="/admin?date=${date}">All outlets</a> for who hasn't clocked in anywhere.</p>`
-              : absent.length ? html`<ul class="people-list">
-              ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
-            </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
-          </div>
-          <div class="card">
-            <h2>Working now <span class="count">${working.length}</span></h2>
-            ${working.length ? html`<ul class="people-list">
-              ${working.map(({ w, open }) => html`<li><span>${w.name}</span><span class="muted">${!outlet && outlets.length > 1 && open.in_site ? `${open.in_site} · ` : ''}since ${localTime(open.check_in_at)} · ${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></li>`)}
-            </ul>` : html`<p class="muted">Nobody is clocked in.</p>`}
-          </div>
-          <div class="card">
-            <h2>Clocked out <span class="count">${done.length}</span></h2>
-            ${done.length ? html`<ul class="people-list">
-              ${done.map(({ w, hours, last }) => html`<li><span>${w.name}</span><span class="muted">out ${localTime(last)} · ${fmtHours(hours)} h</span></li>`)}
-            </ul>` : html`<p class="muted">Nobody yet.</p>`}
-          </div>
-        </section>`,
+        ${approvals && otherPending ? html`
+          <div class="alert alert-info">${otherPending} completed shift${otherPending > 1 ? 's' : ''} on other days still waiting for approval. <a href="/admin/pending">Review →</a></div>` : ''}
+
+        <details class="card everything" ${approvals ? 'open' : ''}>
+          <summary><strong>Everyone ${date === today ? 'today' : 'that day'}</strong>
+            <span class="muted">· ${working.length} working · ${done.length} clocked out${outlet ? '' : ` · ${absent.length} not in`}${approvals ? ` · ${pendingCount} to approve` : ''}</span></summary>
+
+          <h2>Check-ins${outlet ? ` at ${outlet}` : ''}</h2>
+          ${shifts.length ? shiftTable(shifts, { back, showOutlet: !outlet && outlets.length > 1, approvals }) : html`<p class="muted">No check-ins yet.</p>`}
+
+          <section class="roster">
+            <div>
+              <h2>Not clocked in <span class="count">${outlet ? '' : absent.length}</span></h2>
+              ${outlet ? html`<p class="muted">Staff aren't tied to one outlet, so see <a href="/admin?date=${date}">All outlets</a> for who hasn't clocked in anywhere.</p>`
+                : absent.length ? html`<ul class="people-list">
+                ${absent.map((w) => html`<li><span>${w.name} ${dueLabel(w)}</span><a class="small" href="/admin/shifts/new?user_id=${w.id}&date=${date}">+ add shift</a></li>`)}
+              </ul>` : html`<p class="muted">Everyone has clocked in.</p>`}
+            </div>
+            <div>
+              <h2>Working now <span class="count">${working.length}</span></h2>
+              ${working.length ? html`<ul class="people-list">
+                ${working.map(({ w, open }) => html`<li><span>${w.name}</span><span class="muted">${!outlet && outlets.length > 1 && open.in_site ? `${open.in_site} · ` : ''}since ${localTime(open.check_in_at)} · ${formatDuration(Date.now() - Date.parse(open.check_in_at))}</span></li>`)}
+              </ul>` : html`<p class="muted">Nobody is clocked in.</p>`}
+            </div>
+            <div>
+              <h2>Clocked out <span class="count">${done.length}</span></h2>
+              ${done.length ? html`<ul class="people-list">
+                ${done.map(({ w, hours, last }) => html`<li><span>${w.name}</span><span class="muted">out ${localTime(last)} · ${fmtHours(hours)} h</span></li>`)}
+              </ul>` : html`<p class="muted">Nobody yet.</p>`}
+            </div>
+          </section>
+        </details>`,
     });
   });
 
@@ -326,7 +355,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
   });
 
   // ---------- Shift detail + edit ----------
-  function shiftForm({ action, shift = null, workers = null, outlets = [], values, submitLabel }) {
+  function shiftForm({ action, shift = null, workers = null, outlets = [], values, submitLabel, approvals = true }) {
     return html`
       <form method="post" action="${action}" class="stack">
         ${workers ? html`
@@ -350,7 +379,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         <label>Reason / note (saved in the audit log)
           <input name="reason" maxlength="300" value="${values.reason || ''}" placeholder="e.g. forgot to clock out, confirmed with worker">
         </label>
-        <label class="checkbox"><input type="checkbox" name="approve" value="1" ${values.approve ? 'checked' : ''}> Approve after saving</label>
+        ${approvals ? html`<label class="checkbox"><input type="checkbox" name="approve" value="1" ${values.approve ? 'checked' : ''}> Approve after saving</label>` : ''}
         <div><button type="submit" class="btn btn-primary">${submitLabel}</button></div>
       </form>`;
   }
@@ -388,6 +417,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             action: '/admin/shifts/new',
             workers,
             outlets,
+            approvals: await approvalsOn(c.get('db')),
             values: { user_id: c.req.query('user_id'), outlet: c.req.query('outlet'), work_date: isDate(qDate) ? qDate : localDate(), in_time: '', out_time: '', approve: true },
             submitLabel: 'Add shift',
           })}
@@ -407,12 +437,12 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         title: 'Add shift',
         error: t.error || 'Choose a worker.',
         body: html`<div class="page-head"><h1>Add a shift manually</h1></div>
-          <section class="card">${shiftForm({ action: '/admin/shifts/new', workers, outlets, values: b, submitLabel: 'Add shift' })}</section>`,
+          <section class="card">${shiftForm({ action: '/admin/shifts/new', workers, outlets, values: b, submitLabel: 'Add shift', approvals: await approvalsOn(db) })}</section>`,
       }, 400);
     }
     const outlet = outletParam(b.outlet, outlets) ?? (outlets.length === 1 ? outlets[0] : null);
     const site = outlet ? await db.get('SELECT * FROM sites WHERE name = ? LIMIT 1', outlet) : null;
-    const approve = b.approve === '1';
+    const approve = b.approve === '1' || !(await approvalsOn(db));
     const userId = c.get('user').id;
     const now = new Date().toISOString();
     // Link it to the working hours it overlaps, like a normal clock-in.
@@ -446,6 +476,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
   async function shiftDetail(c, shift, { error = null, values = null } = {}, status = 200) {
     const db = c.get('db');
+    const approvals = await approvalsOn(db);
     const log = await db.all(`
       SELECT a.*, u.name AS actor FROM audit a LEFT JOIN users u ON u.id = a.actor_id
       WHERE a.shift_id = ? ORDER BY a.at, a.id
@@ -488,7 +519,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
           ${hasFlag(shift.flags, 'no_checkout') ? html`<p class="alert alert-warn">This worker never clocked out. Enter the real check-out time below before approving.</p>` : ''}
           ${shift.check_out_at ? html`
             <div class="action-row">
-              ${approvable(shift) ? html`
+              ${approvals && approvable(shift) ? html`
                 <form method="post" action="/admin/shifts/approve">
                   <input type="hidden" name="ids" value="${shift.id}">
                   <input type="hidden" name="back" value="/admin/shifts/${shift.id}">
@@ -526,7 +557,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
         <section class="card">
           <h2>${shift.check_out_at ? 'Correct times' : 'Close shift'}</h2>
-          ${shiftForm({ action: `/admin/shifts/${shift.id}/edit`, shift, values: v, submitLabel: 'Save' })}
+          ${shiftForm({ action: `/admin/shifts/${shift.id}/edit`, shift, values: v, submitLabel: 'Save', approvals })}
         </section>
 
         <section class="card">
@@ -557,7 +588,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
     if (t.inIso !== shift.check_in_at) changes.push(`in ${localDateTime(shift.check_in_at)} → ${localDateTime(t.inIso)}`);
     if (t.outIso !== shift.check_out_at) changes.push(`out ${shift.check_out_at ? localDateTime(shift.check_out_at) : '—'} → ${t.outIso ? localDateTime(t.outIso) : '—'}`);
     const reason = String(b.reason || '').trim().slice(0, 300);
-    const approve = b.approve === '1' && !!t.outIso && (changes.length > 0 || !hasFlag(shift.flags, 'no_checkout'));
+    const approve = (b.approve === '1' || !(await approvalsOn(db))) && !!t.outIso
+      && (changes.length > 0 || !hasFlag(shift.flags, 'no_checkout'));
     const userId = c.get('user').id;
     const now = new Date().toISOString();
 
@@ -1027,6 +1059,14 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
               <textarea name="allowed_ips" rows="2" placeholder="e.g. 203.0.113.25, 198.51.100.0/24">${s.allowed_ips}</textarea>
               <span class="hint">Your current IP address is <strong>${normalizeIp(c.get('ip'))}</strong>. Open this page while connected to the venue WiFi to see the venue’s address. Separate several with commas; IPv4 ranges like 203.0.113.0/24 and prefixes ending in * are allowed.</span>
             </label>
+            <h3>Approvals</h3>
+            <label>Approve shifts
+              <select name="approvals">
+                ${opt('approvals', 'on', 'A supervisor approves each shift (for paying by the hour)')}
+                ${opt('approvals', 'off', 'Off — shifts are approved automatically when staff clock out')}
+              </select>
+              <span class="hint">Turn this off if you only need an attendance record. Problems are still shown under “Needs attention” on the Dashboard. Turning it off approves any shifts still waiting.</span>
+            </label>
             <h3>Attendance record</h3>
             <label>Late arrivals, early leaves and days off
               <select name="attendance_mode">
@@ -1105,10 +1145,22 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
       setSettingStmt('selfie_mode', pick(b.selfie_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('attendance_mode', pick(b.attendance_mode, ['off', 'on'], 'off')),
+      setSettingStmt('approvals', pick(b.approvals, ['on', 'off'], 'on')),
       setSettingStmt('late_grace_min', minutes(b.late_grace_min, 60, 5)),
       setSettingStmt('days_off_per_week', minutes(b.days_off_per_week, 6, 1)),
       ...(hours.ranges?.length ? [setSettingStmt('work_hours', formatRanges(hours.ranges))] : []),
     ]);
+    if (b.approvals === 'off') {
+      // Approvals turned off: approve everything still waiting, except forgotten clock-outs (they need a real time).
+      const { rows } = await c.get('db').run(`
+        UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?
+        WHERE status = 'pending' AND check_out_at IS NOT NULL AND (',' || flags || ',') NOT LIKE '%,no_checkout,%'
+        RETURNING id
+      `, c.get('user').id, new Date().toISOString());
+      for (let i = 0; i < rows.length; i += 50) {
+        await c.get('db').batch(rows.slice(i, i + 50).map((r) => auditStmt(r.id, c.get('user').id, 'approve', 'approvals turned off')));
+      }
+    }
     if (b.work_hours !== undefined && !hours.ranges?.length) {
       return c.redirect(withMsg('/admin/settings', `Settings saved, but not the working hours: ${hours.error || 'enter them like 10:00-22:00.'}`));
     }

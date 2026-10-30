@@ -264,15 +264,18 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       }
 
       const workerNote = [open.worker_note, note].filter(Boolean).join(' / ') || null;
+      // Without an Approvals step, the shift is approved as soon as they clock out.
+      const autoApprove = s.approvals === 'off';
       await db.batch([
         [`UPDATE shifts SET check_out_at = ?, out_lat = ?, out_lng = ?, out_accuracy = ?, out_site = ?, out_distance_m = ?,
-            out_ip = ?, out_device_id = ?, flags = ?, worker_note = ?
+            out_ip = ?, out_device_id = ?, flags = ?, worker_note = ?${autoApprove ? ", status = 'approved', reviewed_at = ?" : ''}
           WHERE id = ? AND check_out_at IS NULL`,
-        now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, addFlags(open.flags, ...flags), workerNote, open.id],
+        now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, addFlags(open.flags, ...flags), workerNote,
+        ...(autoApprove ? [now] : []), open.id],
         auditStmt(open.id, uid, 'clock_out'),
       ]);
       const hrs = paidHours(open.check_in_at, now);
-      return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked out at ${localTime(now)} — ${formatHM(hrs)} counted (${localTime(roundTime(open.check_in_at))}–${localTime(roundTime(now))}). Waiting for supervisor approval.` });
+      return c.json({ ok: true, deviceKey: device.device_key, message: `Clocked out at ${localTime(now)} — ${formatHM(hrs)} counted (${localTime(roundTime(open.check_in_at))}–${localTime(roundTime(now))}).${autoApprove ? '' : ' Waiting for supervisor approval.'}` });
     } catch (err) {
       if (/UNIQUE/.test(err.message)) return c.json({ error: "You're already clocked in." }, 409);
       throw err;

@@ -143,6 +143,8 @@ export const DEFAULT_SETTINGS = {
   days_off_per_week: '1',
   // Minutes of leeway before arriving counts as late, or leaving counts as early.
   late_grace_min: '5',
+  // on | off — off: shifts are approved automatically at clock-out (no Approvals step).
+  approvals: 'on',
   // off | flag | block — selfie at clock-in: off, ask (flag if skipped), or required.
   selfie_mode: 'off',
 };

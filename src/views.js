@@ -92,13 +92,13 @@ export function setAppName(name) {
   APP_NAME = String(name || '').trim().slice(0, 40) || DEFAULT_APP_NAME;
 }
 
-function nav(user, active, { attendance = false } = {}) {
+function nav(user, active, { attendance = false, approvals = true } = {}) {
   if (!user) return '';
   const link = (href, label, key) => html`<a href="${href}" class="${active === key ? 'active' : ''}">${label}</a>`;
   const links = user.role === 'supervisor'
     ? [
       link('/admin', 'Dashboard', 'dashboard'),
-      link('/admin/pending', 'Approvals', 'pending'),
+      ...(approvals ? [link('/admin/pending', 'Approvals', 'pending')] : []),
       ...(attendance ? [link('/admin/attendance', 'Attendance', 'attendance')] : []),
       link('/admin/export', 'Export', 'export'),
       link('/admin/people', 'People', 'people'),
@@ -118,7 +118,7 @@ function nav(user, active, { attendance = false } = {}) {
     </nav>`;
 }
 
-export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [], attendance = false }) {
+export function layout({ title, user = null, active = '', flash = null, error = null, body, scripts = [], attendance = false, approvals = true }) {
   return html`<!doctype html>
 <html lang="en">
 <head>
@@ -131,7 +131,7 @@ export function layout({ title, user = null, active = '', flash = null, error = 
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
 </head>
 <body>
-  ${nav(user, active, { attendance })}
+  ${nav(user, active, { attendance, approvals })}
   <main class="container">
     ${flash ? html`<div class="alert alert-ok" role="status">${flash}</div>` : ''}
     ${error ? html`<div class="alert alert-error" role="alert">${error}</div>` : ''}

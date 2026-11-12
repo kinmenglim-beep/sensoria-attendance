@@ -62,7 +62,8 @@ export function createApp({ dbFor, getIp, trustProxy = false, assets = null }) {
   async function render(c, opts, status = 200) {
     const user = c.get('user');
     const flash = opts.flash !== undefined ? opts.flash : (c.req.query('ok') ?? null);
-    // Menu items that depend on Settings: Attendance once it's on, Approvals unless they're off.
+    // Menu items that depend on Settings: Attendance once it's on, Approvals unless they're off
+    // (with "clean" approval, the Approvals page lists only flagged shifts).
     const s = user?.role === 'supervisor' ? await getSettings(c.get('db')) : null;
     const attendance = s?.attendance_mode === 'on';
     const approvals = s ? s.approvals !== 'off' : true;

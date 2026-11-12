@@ -1,5 +1,5 @@
 import {
-  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag, PHOTO_KEEP_DAYS,
+  getSettings, setSettingStmt, auditStmt, addFlags, removeFlags, hasFlag, isClean, PHOTO_KEEP_DAYS,
 } from '../db.js';
 import { hashSecret } from '../auth.js';
 import {
@@ -178,6 +178,8 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
 
     // "Needs attention": only what's wrong, so a quick look is enough.
     const approvals = settings.approvals !== 'off';
+    // Approving every shift by hand needs the full list open; otherwise only problems matter.
+    const approveAll = settings.approvals === 'on';
     const NOT_A_PROBLEM = ['manual', 'edited'];
     const attention = [];
     for (const s of shifts) {
@@ -242,7 +244,7 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
         ${approvals && otherPending ? html`
           <div class="alert alert-info">${otherPending} completed shift${otherPending > 1 ? 's' : ''} on other days still waiting for approval. <a href="/admin/pending">Review →</a></div>` : ''}
 
-        <details class="card everything" ${approvals ? 'open' : ''}>
+        <details class="card everything" ${approveAll ? 'open' : ''}>
           <summary><strong>Everyone ${date === today ? 'today' : 'that day'}</strong>
             <span class="muted">· ${working.length} working · ${done.length} clocked out${outlet ? '' : ` · ${absent.length} not in`}${approvals ? ` · ${pendingCount} to approve` : ''}</span></summary>
 
@@ -1062,10 +1064,11 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
             <h3>Approvals</h3>
             <label>Approve shifts
               <select name="approvals">
-                ${opt('approvals', 'on', 'A supervisor approves each shift (for paying by the hour)')}
-                ${opt('approvals', 'off', 'Off — shifts are approved automatically when staff clock out')}
+                ${opt('approvals', 'on', 'A supervisor approves every shift')}
+                ${opt('approvals', 'clean', 'Approve automatically unless something is flagged (recommended)')}
+                ${opt('approvals', 'off', 'Off — approve every shift automatically, flagged or not')}
               </select>
-              <span class="hint">Turn this off if you only need an attendance record. Problems are still shown under “Needs attention” on the Dashboard. Turning it off approves any shifts still waiting.</span>
+              <span class="hint">With the recommended option, a shift with no problems (on time, at the outlet, own phone…) is approved when the person clocks out; only flagged ones wait for you under Approvals and “Needs attention”. Switching to it approves the clean shifts already waiting.</span>
             </label>
             <h3>Attendance record</h3>
             <label>Late arrivals, early leaves and days off
@@ -1145,20 +1148,26 @@ export function registerAdminRoutes(app, { render, form, requireSupervisor }) {
       setSettingStmt('device_alert_count', alertCount >= 2 && alertCount <= 20 ? alertCount : 3),
       setSettingStmt('selfie_mode', pick(b.selfie_mode, ['off', 'flag', 'block'], 'off')),
       setSettingStmt('attendance_mode', pick(b.attendance_mode, ['off', 'on'], 'off')),
-      setSettingStmt('approvals', pick(b.approvals, ['on', 'off'], 'on')),
+      setSettingStmt('approvals', pick(b.approvals, ['on', 'clean', 'off'], 'on')),
       setSettingStmt('late_grace_min', minutes(b.late_grace_min, 60, 5)),
       setSettingStmt('days_off_per_week', minutes(b.days_off_per_week, 6, 1)),
       ...(hours.ranges?.length ? [setSettingStmt('work_hours', formatRanges(hours.ranges))] : []),
     ]);
-    if (b.approvals === 'off') {
-      // Approvals turned off: approve everything still waiting, except forgotten clock-outs (they need a real time).
-      const { rows } = await c.get('db').run(`
-        UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ?
-        WHERE status = 'pending' AND check_out_at IS NOT NULL AND (',' || flags || ',') NOT LIKE '%,no_checkout,%'
-        RETURNING id
-      `, c.get('user').id, new Date().toISOString());
-      for (let i = 0; i < rows.length; i += 50) {
-        await c.get('db').batch(rows.slice(i, i + 50).map((r) => auditStmt(r.id, c.get('user').id, 'approve', 'approvals turned off')));
+    if (b.approvals === 'off' || b.approvals === 'clean') {
+      // Approve what's waiting that the new setting would have approved: everything with approvals off,
+      // only shifts without problems with "clean". Forgotten clock-outs always need a real time first.
+      const db = c.get('db');
+      const userId = c.get('user').id;
+      const now = new Date().toISOString();
+      const waiting = await db.all("SELECT id, flags FROM shifts WHERE status = 'pending' AND check_out_at IS NOT NULL");
+      const ids = waiting.filter((x) => !hasFlag(x.flags, 'no_checkout') && (b.approvals === 'off' || isClean(x.flags))).map((x) => x.id);
+      const why = b.approvals === 'off' ? 'approvals turned off' : 'nothing flagged';
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        await db.batch([
+          [`UPDATE shifts SET status = 'approved', reviewed_by = ?, reviewed_at = ? WHERE id IN (${chunk.map(() => '?').join(',')})`, userId, now, ...chunk],
+          ...chunk.map((id) => auditStmt(id, userId, 'approve', why)),
+        ]);
       }
     }
     if (b.work_hours !== undefined && !hours.ranges?.length) {

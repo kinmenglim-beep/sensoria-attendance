@@ -1,4 +1,4 @@
-import { getSettings, auditStmt, addFlags, removeFlags, PHOTO_KEEP_DAYS } from '../db.js';
+import { getSettings, auditStmt, addFlags, removeFlags, isClean, PHOTO_KEEP_DAYS } from '../db.js';
 import { envVar } from '../env.js';
 import {
   TZ, localDate, localTime, roundTime, addDays, addMonths, paidHours, formatDuration, formatHM, prettyDate, prettyMonth, isMonth,
@@ -192,7 +192,7 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         sched = { start: m.slot.startIso, end: m.slot.endIso };
         // Coming back from a break within the same working hours: not late again, and the
         // earlier clock-out wasn't leaving early after all.
-        backFromBreak.push(...await db.all('SELECT id, flags FROM shifts WHERE user_id = ? AND sched_start = ?', uid, sched.start));
+        backFromBreak.push(...await db.all('SELECT id, flags, status, check_out_at FROM shifts WHERE user_id = ? AND sched_start = ?', uid, sched.start));
         if (m.status === 'late' && !backFromBreak.length) {
           flags.push('in:late');
           lateMin = m.lateMin;
@@ -250,7 +250,14 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
         const results = await db.batch(stmts);
         const shiftId = results[results.length - 1].lastId;
         const after = [auditStmt(shiftId, uid, 'clock_in')];
-        for (const x of backFromBreak) after.push(['UPDATE shifts SET flags = ? WHERE id = ?', removeFlags(x.flags, 'out:left_early'), x.id]);
+        for (const x of backFromBreak) {
+          const cleared = removeFlags(x.flags, 'out:left_early');
+          after.push(['UPDATE shifts SET flags = ? WHERE id = ?', cleared, x.id]);
+          // Its only problem was "left early": with clean shifts approved automatically, approve it now.
+          if (s.approvals === 'clean' && isClean(cleared) && x.status === 'pending' && x.check_out_at) {
+            after.push(["UPDATE shifts SET status = 'approved', reviewed_at = ? WHERE id = ? AND status = 'pending'", now, x.id]);
+          }
+        }
         if (selfie) {
           after.push(['INSERT INTO photos (shift_id, kind, data, taken_at) VALUES (?, ?, ?, ?)', shiftId, 'in', selfie, now]);
           after.push(['DELETE FROM photos WHERE taken_at < ?', new Date(Date.now() - PHOTO_KEEP_DAYS * 86400000).toISOString()]);
@@ -264,13 +271,14 @@ export function registerWorkerRoutes(app, { render, requireWorker }) {
       }
 
       const workerNote = [open.worker_note, note].filter(Boolean).join(' / ') || null;
-      // Without an Approvals step, the shift is approved as soon as they clock out.
-      const autoApprove = s.approvals === 'off';
+      // Approved as soon as they clock out: always with approvals off, or when nothing was flagged.
+      const finalFlags = addFlags(open.flags, ...flags);
+      const autoApprove = s.approvals === 'off' || (s.approvals === 'clean' && isClean(finalFlags));
       await db.batch([
         [`UPDATE shifts SET check_out_at = ?, out_lat = ?, out_lng = ?, out_accuracy = ?, out_site = ?, out_distance_m = ?,
             out_ip = ?, out_device_id = ?, flags = ?, worker_note = ?${autoApprove ? ", status = 'approved', reviewed_at = ?" : ''}
           WHERE id = ? AND check_out_at IS NULL`,
-        now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, addFlags(open.flags, ...flags), workerNote,
+        now, loc.lat, loc.lng, loc.accuracy, loc.site, loc.distance, ip, device.id, finalFlags, workerNote,
         ...(autoApprove ? [now] : []), open.id],
         auditStmt(open.id, uid, 'clock_out'),
       ]);

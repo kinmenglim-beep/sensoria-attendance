@@ -577,6 +577,45 @@ test('approvals off: shifts approve themselves and the dashboard shows only what
   assert.match(r.text, /<strong>Lim Kin Meng<\/strong>[\s\S]*Checked in outside area/);
 });
 
+test('approve automatically unless flagged: clean shifts approve themselves, flagged ones wait', async () => {
+  const { sup, wkr, db } = await restaurant();
+  await sup('POST', '/admin/sites', { form: { name: 'Venue', lat: '3.139', lng: '101.6869', radius_m: '100' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'flag', ip_mode: 'off', approvals: 'on' } });
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  const at = { lat: 3.1391, lng: 101.6869, accuracy: 5 };
+  const away = { lat: 3.2, lng: 101.7, accuracy: 5 };
+  const lastStatus = async () => (await db.get('SELECT status FROM shifts ORDER BY id DESC LIMIT 1')).status;
+
+  // Waiting from before: one clean shift, one clocked out away from the venue.
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'out', ...away } });
+  assert.deepEqual((await db.all('SELECT status FROM shifts ORDER BY id')).map((x) => x.status), ['pending', 'pending']);
+
+  // Switching approves only the clean one that was waiting.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'flag', ip_mode: 'off', approvals: 'clean' } });
+  assert.deepEqual((await db.all('SELECT status FROM shifts ORDER BY id')).map((x) => x.status), ['approved', 'pending']);
+
+  // From now on: clean → approved at clock-out; flagged → waits.
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  let r = await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  assert.doesNotMatch(JSON.parse(r.text).message, /approval/);
+  assert.equal(await lastStatus(), 'approved');
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...away } });
+  r = await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  assert.match(JSON.parse(r.text).message, /Waiting for supervisor approval/);
+  assert.equal(await lastStatus(), 'pending');
+
+  // The Approvals page and Needs attention list only the flagged ones; the full list is folded away.
+  r = await sup('GET', '/admin/pending');
+  assert.equal((r.text.match(/name="ids"/g) || []).length, 2);
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /href="\/admin\/pending"/);
+  assert.match(r.text, /Checked in outside area/);
+  assert.match(r.text, /<details class="card everything" >/);
+});
+
 test('selfie: required, stored with the shift and shown to supervisors only', async () => {
   const { sup, wkr, db } = await restaurant({ selfie_mode: 'block' });
   await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });

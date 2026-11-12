@@ -143,6 +143,9 @@ export const DEFAULT_SETTINGS = {
   days_off_per_week: '1',
   // Minutes of leeway before arriving counts as late, or leaving counts as early.
   late_grace_min: '5',
+  // on | clean | off — on: a supervisor approves each shift; clean: shifts without any problem
+  // flag are approved automatically at clock-out and only flagged ones wait; off: all are approved.
+  approvals: 'on',
   // off | flag | block — selfie at clock-in: off, ask (flag if skipped), or required.
   selfie_mode: 'off',
 };
@@ -179,6 +182,11 @@ export const auditStmt = (shiftId, actorId, action, detail = null) => [
 export function removeFlags(existing, ...flags) {
   return String(existing || '').split(',').filter((f) => f && !flags.includes(f)).join(',');
 }
+
+// Flags that are a note rather than a problem: they don't stop a shift being approved automatically.
+const NOTE_FLAGS = ['manual', 'edited'];
+/** True when a shift has no problem flags (late, no GPS, wrong phone…). */
+export const isClean = (flags) => String(flags || '').split(',').every((f) => !f || NOTE_FLAGS.includes(f));
 
 export const hasFlag = (flags, flag) => String(flags || '').split(',').includes(flag);
 

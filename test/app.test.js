@@ -261,8 +261,8 @@ test('devices: registered phone, shared and changed devices are flagged for supe
 
   // The supervisor dashboard lists it as a phone to review.
   r = await sup('GET', '/admin');
-  assert.match(r.text, /Unregistered phones to review/);
-  assert.match(r.text, /Alice — SM-A515F · Android 13 · Chrome/);
+  assert.match(r.text, /New phone to review/);
+  assert.match(r.text, /New phone to review: SM-A515F · Android 13 · Chrome/);
 
   // Bob signs in on Alice's phone (the device cookie survives log-out).
   await alicePhone('POST', '/logout');
@@ -309,8 +309,8 @@ test('devices: registered phone, shared and changed devices are flagged for supe
   await thirdPhone('POST', '/api/clock', { json: { action: 'in' } });
   assert.equal((await flagsOf(await lastId())), 'in:unregistered_device,in:many_devices');
   r = await sup('GET', '/admin');
-  assert.match(r.text, /Frequent phone changes/);
-  assert.match(r.text, /Alice \(3 phones\)/);
+  assert.match(r.text, /different phones in 30 days/);
+  assert.match(r.text, /<strong>Alice<\/strong>.*\n?.*🚩 3 different phones in 30 days/);
   r = await sup('GET', '/admin/people');
   assert.match(r.text, /🚩 3/);
   await thirdPhone('POST', '/api/clock', { json: { action: 'out' } });
@@ -499,7 +499,7 @@ test('outlets: clock-ins are filed under the nearest outlet and each can be view
   assert.match(r.text, /All outlets/);
   assert.match(r.text, /<th>Outlet<\/th>/);
   r = await sup('GET', '/admin?outlet=PJ');
-  assert.match(r.text, /Check-ins today at PJ/);
+  assert.match(r.text, /Check-ins at PJ/);
   assert.match(r.text, /Lim Kin Meng/);
   assert.doesNotMatch(r.text, /Siti/);
   r = await sup('GET', '/admin?outlet=Nowhere'); // unknown outlet: everything
@@ -536,6 +536,84 @@ test('outlets: clock-ins are filed under the nearest outlet and each can be view
   const kl = await db.get("SELECT id FROM sites WHERE name = 'KL'");
   await sup('POST', `/admin/sites/${kl.id}/hours`, { form: { work_hours: '' } });
   assert.equal((await db.get('SELECT work_hours FROM sites WHERE id = ?', kl.id)).work_hours, null);
+});
+
+test('approvals off: shifts approve themselves and the dashboard shows only what needs attention', async () => {
+  const { sup, wkr, db, client } = await restaurant();
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  let r = await sup('GET', '/admin');
+  assert.match(r.text, /Nothing needs your attention/);
+  assert.match(r.text, /href="\/admin\/pending"/);
+
+  // A shift waiting for approval, and a forgotten clock-out from an earlier day.
+  await wkr('POST', '/api/clock', { json: { action: 'in' } });
+  await wkr('POST', '/api/clock', { json: { action: 'out' } });
+  const { localTime } = await import('../src/time.js');
+  const old = new Date(Date.now() - 30 * 3600000).toISOString();
+  await db.run("INSERT INTO shifts (user_id, work_date, check_in_at, check_out_at, flags) VALUES (1, ?, ?, ?, 'no_checkout')", localDate(old), old, old);
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM shifts WHERE status = 'pending'")).n, 2);
+
+  // Turning approvals off approves what's waiting, except the forgotten clock-out.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'off', ip_mode: 'off', approvals: 'off' } });
+  assert.deepEqual((await db.all('SELECT status FROM shifts ORDER BY id')).map((x) => x.status), ['approved', 'pending']);
+  r = await sup('GET', '/admin');
+  assert.doesNotMatch(r.text, /href="\/admin\/pending"/); // no Approvals menu
+  assert.doesNotMatch(r.text, /name="ids"/); // no approve tick boxes
+  assert.match(r.text, /Needs attention/);
+  assert.match(r.text, /Never clocked out on/);
+  assert.match(r.text, /<details class="card everything" >/); // everything else folded away
+
+  // New shifts approve themselves at clock-out, flagged ones included.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'require', ip_mode: 'off', approvals: 'off' } });
+  r = await wkr('POST', '/api/clock', { json: { action: 'in', lat: 3.2, lng: 101.7 } });
+  r = await wkr('POST', '/api/clock', { json: { action: 'out', lat: 3.2, lng: 101.7 } });
+  assert.doesNotMatch(JSON.parse(r.text).message, /approval/);
+  assert.equal((await db.get('SELECT status FROM shifts ORDER BY id DESC LIMIT 1')).status, 'approved');
+
+  // Flags still show up under Needs attention.
+  await sup('POST', '/admin/sites', { form: { name: 'Venue', lat: '3.139', lng: '101.6869', radius_m: '100' } });
+  await wkr('POST', '/api/clock', { json: { action: 'in', lat: 3.2, lng: 101.7 } });
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /<strong>Lim Kin Meng<\/strong>[\s\S]*Checked in outside area/);
+});
+
+test('approve automatically unless flagged: clean shifts approve themselves, flagged ones wait', async () => {
+  const { sup, wkr, db } = await restaurant();
+  await sup('POST', '/admin/sites', { form: { name: 'Venue', lat: '3.139', lng: '101.6869', radius_m: '100' } });
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'flag', ip_mode: 'off', approvals: 'on' } });
+  await wkr('POST', '/login', { form: { login: 'KML', secret: '1234' } });
+  const at = { lat: 3.1391, lng: 101.6869, accuracy: 5 };
+  const away = { lat: 3.2, lng: 101.7, accuracy: 5 };
+  const lastStatus = async () => (await db.get('SELECT status FROM shifts ORDER BY id DESC LIMIT 1')).status;
+
+  // Waiting from before: one clean shift, one clocked out away from the venue.
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  await wkr('POST', '/api/clock', { json: { action: 'out', ...away } });
+  assert.deepEqual((await db.all('SELECT status FROM shifts ORDER BY id')).map((x) => x.status), ['pending', 'pending']);
+
+  // Switching approves only the clean one that was waiting.
+  await sup('POST', '/admin/settings', { form: { geofence_mode: 'flag', ip_mode: 'off', approvals: 'clean' } });
+  assert.deepEqual((await db.all('SELECT status FROM shifts ORDER BY id')).map((x) => x.status), ['approved', 'pending']);
+
+  // From now on: clean → approved at clock-out; flagged → waits.
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...at } });
+  let r = await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  assert.doesNotMatch(JSON.parse(r.text).message, /approval/);
+  assert.equal(await lastStatus(), 'approved');
+  await wkr('POST', '/api/clock', { json: { action: 'in', ...away } });
+  r = await wkr('POST', '/api/clock', { json: { action: 'out', ...at } });
+  assert.match(JSON.parse(r.text).message, /Waiting for supervisor approval/);
+  assert.equal(await lastStatus(), 'pending');
+
+  // The Approvals page and Needs attention list only the flagged ones; the full list is folded away.
+  r = await sup('GET', '/admin/pending');
+  assert.equal((r.text.match(/name="ids"/g) || []).length, 2);
+  r = await sup('GET', '/admin');
+  assert.match(r.text, /href="\/admin\/pending"/);
+  assert.match(r.text, /Checked in outside area/);
+  assert.match(r.text, /<details class="card everything" >/);
 });
 
 test('selfie: required, stored with the shift and shown to supervisors only', async () => {

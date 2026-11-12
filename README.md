@@ -140,6 +140,19 @@ last clock-out, so clocking out and in for a break counts once. Times corrected 
 forgotten clock-in can be added as a manual shift so the day counts as worked. A shift with a missing clock-out isn't
 counted as leaving early. Pay and the monthly export are not affected.
 
+### Approvals and "Needs attention"
+
+**Settings → Approvals** has three options:
+- *A supervisor approves every shift* (default).
+- *Approve automatically unless something is flagged*: a shift with no problem flags is approved when the worker clocks
+  out; flagged ones (late, no GPS, outside the area, wrong phone…) wait on the Approvals page. Switching to it approves
+  the clean shifts already waiting.
+- *Off*: every shift is approved at clock-out (and anything waiting is approved); the Approvals page is hidden.
+
+With either automatic option the dashboard's full lists are folded away. Either way, the dashboard opens
+with **Needs attention**: only that day's problems (any flag, someone missing who already had their days off this
+week, forgotten clock-outs, phones to review). A forgotten clock-out still needs a supervisor to enter the real time.
+
 ### Several outlets
 
 Add each outlet as a **work site** in Settings (e.g. "PJ" and "KL"). Staff aren't tied to one outlet: each clock-in is
